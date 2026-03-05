@@ -146,9 +146,9 @@ def train():
     if is_main:
         os.makedirs(config.checkpoint_dir, exist_ok=True)
 
-    # Compute embedding scale factor (normalize to unit variance for diffusion)
+    # Compute embedding scale factor (normalize to unit per-dim variance for diffusion)
     with torch.no_grad():
-        emb_scale = raw_model.token_embedding.weight.norm(dim=-1).mean().item()
+        emb_scale = raw_model.token_embedding.weight.std().item()
     if is_main:
         print(f"Embedding scale factor: {emb_scale:.2f}")
 
