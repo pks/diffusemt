@@ -44,7 +44,7 @@ class GaussianDiffusion(nn.Module):
                  embedding_weight=None, x0_self_cond=None):
         """Single reverse step: denoise xt -> x_{t-1}.
 
-        Model predicts epsilon (noise). We recover x0, optionally clamp,
+        Model predicts x0 (clean embeddings) directly. Optionally clamp,
         then compute the DDPM posterior.
 
         Returns (x_{t-1}, predicted_x0) for self-conditioning.
@@ -52,12 +52,9 @@ class GaussianDiffusion(nn.Module):
         B = xt.shape[0]
         t = torch.full((B,), t_int, device=xt.device, dtype=torch.long)
 
-        # Model predicts noise (epsilon), with self-conditioning on prev x0
-        predicted_eps = model(source_ids, source_mask, xt, t,
-                              x0_self_cond=x0_self_cond)
-
-        # Recover x0 from predicted noise
-        predicted_x0 = self.predict_x0_from_eps(xt, t, predicted_eps)
+        # Model predicts x0 directly, with self-conditioning on prev x0
+        predicted_x0 = model(source_ids, source_mask, xt, t,
+                             x0_self_cond=x0_self_cond)
 
         # Clamp: snap predicted x0 to nearest valid token embedding
         if embedding_weight is not None:

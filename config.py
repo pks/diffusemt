@@ -24,7 +24,7 @@ class Config:
     log_every: int = 100
     val_every: int = 2500
     save_every: int = 5000
-    checkpoint_dir: str = "checkpoints"
+    checkpoint_dir: str = "checkpoints_v6"
 
     # Data
     tokenizer_name: str = "bert-base-multilingual-cased"

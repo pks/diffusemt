@@ -24,7 +24,7 @@ def cleanup_ddp():
 
 @torch.no_grad()
 def validate(model, raw_model, diffusion, val_dataloader, config, device, emb_scale):
-    """Run validation and return average epsilon-prediction MSE loss."""
+    """Run validation and return average x0-prediction MSE loss."""
     model.eval()
     total_loss = 0.0
     total_batches = 0
@@ -40,13 +40,12 @@ def validate(model, raw_model, diffusion, val_dataloader, config, device, emb_sc
         xt, noise = diffusion.q_sample(x0, t)
 
         with torch.amp.autocast("cuda", dtype=torch.float16):
-            pred_eps = model(source_ids, source_mask, xt, t).detach()
-            x0_self_cond = diffusion.predict_x0_from_eps(xt, t, pred_eps)
-            predicted_eps = model(source_ids, source_mask, xt, t,
-                                  x0_self_cond=x0_self_cond)
+            pred_x0 = model(source_ids, source_mask, xt, t).detach()
+            predicted_x0 = model(source_ids, source_mask, xt, t,
+                                 x0_self_cond=pred_x0)
 
         mask = target_mask.unsqueeze(-1).float()
-        loss = ((predicted_eps.float() - noise) ** 2 * mask).sum() / mask.sum() / config.embed_dim
+        loss = ((predicted_x0.float() - x0) ** 2 * mask).sum() / mask.sum() / config.embed_dim
         total_loss += loss.item()
         total_batches += 1
 
@@ -188,18 +187,17 @@ def train():
             x0_self_cond = None
             if torch.rand(1).item() > 0.5:
                 with torch.no_grad(), torch.amp.autocast("cuda", dtype=torch.float16):
-                    pred_eps = model(source_ids, source_mask, xt, t)
-                    x0_self_cond = diffusion.predict_x0_from_eps(xt, t, pred_eps).detach()
+                    x0_self_cond = model(source_ids, source_mask, xt, t).detach()
 
-            # Model predicts noise (epsilon) — mixed precision forward
+            # Model predicts x0 (clean embeddings) — mixed precision forward
             with torch.amp.autocast("cuda", dtype=torch.float16):
-                predicted_eps = model(source_ids, source_mask, xt, t,
-                                      x0_self_cond=x0_self_cond)
+                predicted_x0 = model(source_ids, source_mask, xt, t,
+                                     x0_self_cond=x0_self_cond)
 
-            # MSE loss on noise prediction, only on real token positions
+            # MSE loss on x0 prediction, only on real token positions
             # Compute loss in fp32 for stability
             mask = target_mask.unsqueeze(-1).float()  # (B, T, 1)
-            loss = ((predicted_eps.float() - noise) ** 2 * mask).sum() / mask.sum() / config.embed_dim
+            loss = ((predicted_x0.float() - x0) ** 2 * mask).sum() / mask.sum() / config.embed_dim
             loss = loss / config.grad_accum_steps
             scaler.scale(loss).backward()
 
