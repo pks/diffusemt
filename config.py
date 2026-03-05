@@ -3,11 +3,11 @@ from dataclasses import dataclass
 
 @dataclass
 class Config:
-    # Model (BERT-base sized)
-    embed_dim: int = 768
-    num_heads: int = 12
-    num_layers: int = 12
-    ff_dim: int = 3072
+    # Model (BERT-large sized)
+    embed_dim: int = 1024
+    num_heads: int = 16
+    num_layers: int = 28
+    ff_dim: int = 4096
     dropout: float = 0.1
     max_seq_len: int = 128
 
@@ -18,8 +18,8 @@ class Config:
 
     # Training
     batch_size: int = 64
-    grad_accum_steps: int = 4
-    lr: float = 1e-4
+    grad_accum_steps: int = 6
+    lr: float = 2e-4
     num_train_steps: int = 50000
     log_every: int = 100
     val_every: int = 2500

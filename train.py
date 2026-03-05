@@ -39,19 +39,50 @@ def validate(model, raw_model, diffusion, val_dataloader, config, device, emb_sc
         t = torch.randint(0, config.timesteps, (B,), device=device)
         xt, noise = diffusion.q_sample(x0, t)
 
-        # Self-conditioning: predict eps, recover x0, feed back
-        pred_eps = model(source_ids, source_mask, xt, t).detach()
-        x0_self_cond = diffusion.predict_x0_from_eps(xt, t, pred_eps)
-        predicted_eps = model(source_ids, source_mask, xt, t,
-                              x0_self_cond=x0_self_cond)
+        with torch.amp.autocast("cuda", dtype=torch.float16):
+            pred_eps = model(source_ids, source_mask, xt, t).detach()
+            x0_self_cond = diffusion.predict_x0_from_eps(xt, t, pred_eps)
+            predicted_eps = model(source_ids, source_mask, xt, t,
+                                  x0_self_cond=x0_self_cond)
 
         mask = target_mask.unsqueeze(-1).float()
-        loss = ((predicted_eps - noise) ** 2 * mask).sum() / mask.sum() / config.embed_dim
+        loss = ((predicted_eps.float() - noise) ** 2 * mask).sum() / mask.sum() / config.embed_dim
         total_loss += loss.item()
         total_batches += 1
 
     model.train()
     return total_loss / total_batches
+
+
+def enable_gradient_checkpointing(model):
+    """Wrap each encoder/decoder layer with activation checkpointing."""
+    from torch.utils.checkpoint import checkpoint
+
+    for i, layer in enumerate(model.source_encoder.layers):
+        original_forward = layer.forward
+
+        def make_ckpt_forward(orig_fn):
+            def ckpt_forward(src, src_mask=None, src_key_padding_mask=None, is_causal=None):
+                def fn(s, m, kpm):
+                    return orig_fn(s, src_mask=m, src_key_padding_mask=kpm)
+                return checkpoint(fn, src, src_mask, src_key_padding_mask, use_reentrant=False)
+            return ckpt_forward
+
+        layer.forward = make_ckpt_forward(original_forward)
+
+    for i, layer in enumerate(model.target_decoder.layers):
+        original_forward = layer.forward
+
+        def make_ckpt_forward(orig_fn):
+            def ckpt_forward(tgt, memory, tgt_mask=None, memory_mask=None,
+                             tgt_key_padding_mask=None, memory_key_padding_mask=None,
+                             tgt_is_causal=None, memory_is_causal=None):
+                def fn(t, m, mkpm):
+                    return orig_fn(t, m, memory_key_padding_mask=mkpm)
+                return checkpoint(fn, tgt, memory, memory_key_padding_mask, use_reentrant=False)
+            return ckpt_forward
+
+        layer.forward = make_ckpt_forward(original_forward)
 
 
 def train():
@@ -87,6 +118,8 @@ def train():
         max_seq_len=config.max_seq_len,
     ).to(device)
 
+    enable_gradient_checkpointing(model)
+
     if distributed:
         model = DDP(model, device_ids=[local_rank])
 
@@ -101,6 +134,9 @@ def train():
 
     # Optimizer
     optimizer = torch.optim.Adam(model.parameters(), lr=config.lr)
+
+    # Mixed precision
+    scaler = torch.amp.GradScaler("cuda")
 
     # Data
     dataloader, sampler = get_dataloader(config, split="train", distributed=distributed)
@@ -151,27 +187,30 @@ def train():
             # and use it as conditioning for the real prediction
             x0_self_cond = None
             if torch.rand(1).item() > 0.5:
-                with torch.no_grad():
+                with torch.no_grad(), torch.amp.autocast("cuda", dtype=torch.float16):
                     pred_eps = model(source_ids, source_mask, xt, t)
-                    # Recover x0 from predicted noise for self-conditioning
                     x0_self_cond = diffusion.predict_x0_from_eps(xt, t, pred_eps).detach()
 
-            # Model predicts noise (epsilon)
-            predicted_eps = model(source_ids, source_mask, xt, t,
-                                  x0_self_cond=x0_self_cond)
+            # Model predicts noise (epsilon) — mixed precision forward
+            with torch.amp.autocast("cuda", dtype=torch.float16):
+                predicted_eps = model(source_ids, source_mask, xt, t,
+                                      x0_self_cond=x0_self_cond)
 
             # MSE loss on noise prediction, only on real token positions
+            # Compute loss in fp32 for stability
             mask = target_mask.unsqueeze(-1).float()  # (B, T, 1)
-            loss = ((predicted_eps - noise) ** 2 * mask).sum() / mask.sum() / config.embed_dim
+            loss = ((predicted_eps.float() - noise) ** 2 * mask).sum() / mask.sum() / config.embed_dim
             loss = loss / config.grad_accum_steps
-            loss.backward()
+            scaler.scale(loss).backward()
 
             running_loss += loss.item() * config.grad_accum_steps
 
             # Step optimizer every grad_accum_steps
             if (step + 1) % config.grad_accum_steps == 0:
+                scaler.unscale_(optimizer)
                 torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-                optimizer.step()
+                scaler.step(optimizer)
+                scaler.update()
                 optimizer.zero_grad()
 
             step += 1
