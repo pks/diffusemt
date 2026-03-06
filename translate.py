@@ -151,6 +151,7 @@ def main():
         timesteps=config.timesteps,
         beta_start=config.beta_start,
         beta_end=config.beta_end,
+        schedule=getattr(config, 'schedule', 'linear'),
     ).to(device)
 
     if args.partial:

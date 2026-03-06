@@ -15,6 +15,8 @@ class Config:
     timesteps: int = 200
     beta_start: float = 1e-4
     beta_end: float = 0.02
+    schedule: str = "cosine"
+    min_snr_gamma: float = 5.0
 
     # Training
     batch_size: int = 64
@@ -24,7 +26,7 @@ class Config:
     log_every: int = 100
     val_every: int = 2500
     save_every: int = 5000
-    checkpoint_dir: str = "checkpoints_v6"
+    checkpoint_dir: str = "checkpoints_v7"
 
     # Data
     tokenizer_name: str = "bert-base-multilingual-cased"

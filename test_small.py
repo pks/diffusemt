@@ -1,6 +1,6 @@
 """Small-scale sanity check: overfit a tiny model on a few sentences.
 
-Proves the diffusion training loop works end-to-end with the emb_scale fix.
+Proves the diffusion training loop works end-to-end.
 Should see loss drop well below 1.0 and produce recognizable translations
 for the memorized sentences.
 """
@@ -24,6 +24,7 @@ TIMESTEPS = 200
 BATCH_SIZE = 16
 NUM_STEPS = 2000
 LOG_EVERY = 100
+MIN_SNR_GAMMA = 5.0
 
 
 def main():
@@ -49,17 +50,13 @@ def main():
 
     diffusion = GaussianDiffusion(
         timesteps=TIMESTEPS, beta_start=1e-4, beta_end=0.02,
+        schedule="cosine",
     ).to(DEVICE)
 
     # Fixed emb_scale: per-dimension std (should be ~1.0)
     with torch.no_grad():
         emb_scale = model.token_embedding.weight.std().item()
     print(f"emb_scale (std): {emb_scale:.4f}")
-
-    # Also show what the OLD broken scale would be
-    with torch.no_grad():
-        old_scale = model.token_embedding.weight.norm(dim=-1).mean().item()
-    print(f"old emb_scale (L2 norm): {old_scale:.4f}  <-- would crush signal")
 
     optimizer = torch.optim.Adam(model.parameters(), lr=3e-4)
 
@@ -93,8 +90,14 @@ def main():
 
             predicted_x0 = model(source_ids, source_mask, xt, t, x0_self_cond=x0_self_cond)
 
+            # Per-sample MSE with min-SNR weighting
             mask = target_mask.unsqueeze(-1).float()
-            loss = ((predicted_x0 - x0) ** 2 * mask).sum() / mask.sum() / EMBED_DIM
+            per_sample_mse = ((predicted_x0 - x0) ** 2 * mask).sum(dim=(1, 2)) / mask.sum(dim=(1, 2))
+
+            snr = diffusion.snr[t]
+            weight = torch.clamp(snr, max=MIN_SNR_GAMMA) / snr
+            loss = (weight * per_sample_mse).mean()
+
             optimizer.zero_grad()
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -115,9 +118,6 @@ def main():
     class TinyConfig:
         max_seq_len = MAX_SEQ_LEN
         embed_dim = EMBED_DIM
-        timesteps = TIMESTEPS
-        beta_start = 1e-4
-        beta_end = 0.02
 
     for i in range(5):
         item = full_ds[i]

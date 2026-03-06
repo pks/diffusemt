@@ -1,22 +1,39 @@
+import math
 import torch
 import torch.nn as nn
 
 
 class GaussianDiffusion(nn.Module):
-    def __init__(self, timesteps=1000, beta_start=1e-4, beta_end=0.02):
+    def __init__(self, timesteps=1000, beta_start=1e-4, beta_end=0.02,
+                 schedule="cosine"):
         super().__init__()
         self.timesteps = timesteps
 
-        # Linear beta schedule
-        betas = torch.linspace(beta_start, beta_end, timesteps)
-        alphas = 1.0 - betas
-        alpha_bar = torch.cumprod(alphas, dim=0)
+        if schedule == "cosine":
+            # Cosine schedule: alpha_bar(t) = cos(pi/2 * t/T)^2
+            steps = torch.arange(timesteps + 1, dtype=torch.float64)
+            alpha_bar = torch.cos(math.pi / 2 * steps / timesteps) ** 2
+            alpha_bar = alpha_bar / alpha_bar[0]  # normalize so alpha_bar[0] = 1
+            # Derive betas from alpha_bar, clip to prevent singularities
+            betas = 1 - (alpha_bar[1:] / alpha_bar[:-1])
+            betas = betas.clamp(max=0.999).float()
+            alpha_bar = alpha_bar[1:].float()  # drop the t=0 entry
+            alphas = (1.0 - betas)
+        else:
+            # Linear beta schedule
+            betas = torch.linspace(beta_start, beta_end, timesteps)
+            alphas = 1.0 - betas
+            alpha_bar = torch.cumprod(alphas, dim=0)
+
+        # SNR = alpha_bar / (1 - alpha_bar), used for min-SNR weighting
+        snr = alpha_bar / (1.0 - alpha_bar).clamp(min=1e-8)
 
         self.register_buffer("betas", betas)
         self.register_buffer("alphas", alphas)
         self.register_buffer("alpha_bar", alpha_bar)
         self.register_buffer("sqrt_alpha_bar", torch.sqrt(alpha_bar))
         self.register_buffer("sqrt_one_minus_alpha_bar", torch.sqrt(1.0 - alpha_bar))
+        self.register_buffer("snr", snr)
 
     def q_sample(self, x0, t, noise=None):
         """Forward process: add noise to clean embeddings."""

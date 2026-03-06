@@ -24,7 +24,7 @@ def cleanup_ddp():
 
 @torch.no_grad()
 def validate(model, raw_model, diffusion, val_dataloader, config, device, emb_scale):
-    """Run validation and return average x0-prediction MSE loss."""
+    """Run validation and return average x0-prediction MSE loss (min-SNR weighted)."""
     model.eval()
     total_loss = 0.0
     total_batches = 0
@@ -45,7 +45,13 @@ def validate(model, raw_model, diffusion, val_dataloader, config, device, emb_sc
                                  x0_self_cond=pred_x0)
 
         mask = target_mask.unsqueeze(-1).float()
-        loss = ((predicted_x0.float() - x0) ** 2 * mask).sum() / mask.sum() / config.embed_dim
+        per_sample_mse = ((predicted_x0.float() - x0) ** 2 * mask).sum(dim=(1, 2)) / mask.sum(dim=(1, 2))
+
+        # Min-SNR weighting
+        snr = diffusion.snr[t]
+        weight = torch.clamp(snr, max=config.min_snr_gamma) / snr
+        loss = (weight * per_sample_mse).mean()
+
         total_loss += loss.item()
         total_batches += 1
 
@@ -129,6 +135,7 @@ def train():
         timesteps=config.timesteps,
         beta_start=config.beta_start,
         beta_end=config.beta_end,
+        schedule=config.schedule,
     ).to(device)
 
     # Optimizer
@@ -194,10 +201,14 @@ def train():
                 predicted_x0 = model(source_ids, source_mask, xt, t,
                                      x0_self_cond=x0_self_cond)
 
-            # MSE loss on x0 prediction, only on real token positions
-            # Compute loss in fp32 for stability
+            # MSE loss on x0 prediction, per-sample (fp32)
             mask = target_mask.unsqueeze(-1).float()  # (B, T, 1)
-            loss = ((predicted_x0.float() - x0) ** 2 * mask).sum() / mask.sum() / config.embed_dim
+            per_sample_mse = ((predicted_x0.float() - x0) ** 2 * mask).sum(dim=(1, 2)) / mask.sum(dim=(1, 2))
+
+            # Min-SNR weighting: downweight high-noise timesteps
+            snr = diffusion.snr[t]
+            weight = torch.clamp(snr, max=config.min_snr_gamma) / snr  # (B,)
+            loss = (weight * per_sample_mse).mean()
             loss = loss / config.grad_accum_steps
             scaler.scale(loss).backward()
 
