@@ -45,7 +45,7 @@ def validate(model, raw_model, diffusion, val_dataloader, config, device, emb_sc
                                  x0_self_cond=pred_x0)
 
         mask = target_mask.unsqueeze(-1).float()
-        per_sample_mse = ((predicted_x0.float() - x0) ** 2 * mask).sum(dim=(1, 2)) / mask.sum(dim=(1, 2))
+        per_sample_mse = ((predicted_x0.float() - x0) ** 2 * mask).sum(dim=(1, 2)) / mask.sum(dim=(1, 2)) / config.embed_dim
 
         # Min-SNR weighting
         snr = diffusion.snr[t]
@@ -138,8 +138,15 @@ def train():
         schedule=config.schedule,
     ).to(device)
 
-    # Optimizer
+    # Optimizer + lr warmup scheduler
     optimizer = torch.optim.Adam(model.parameters(), lr=config.lr)
+
+    warmup_steps = getattr(config, 'warmup_steps', 0)
+    def lr_lambda(current_step):
+        if warmup_steps == 0:
+            return 1.0
+        return min(1.0, current_step / warmup_steps)
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
     # Mixed precision
     scaler = torch.amp.GradScaler("cuda")
@@ -203,7 +210,7 @@ def train():
 
             # MSE loss on x0 prediction, per-sample (fp32)
             mask = target_mask.unsqueeze(-1).float()  # (B, T, 1)
-            per_sample_mse = ((predicted_x0.float() - x0) ** 2 * mask).sum(dim=(1, 2)) / mask.sum(dim=(1, 2))
+            per_sample_mse = ((predicted_x0.float() - x0) ** 2 * mask).sum(dim=(1, 2)) / mask.sum(dim=(1, 2)) / config.embed_dim
 
             # Min-SNR weighting: downweight high-noise timesteps
             snr = diffusion.snr[t]
@@ -221,12 +228,14 @@ def train():
                 scaler.step(optimizer)
                 scaler.update()
                 optimizer.zero_grad()
+                scheduler.step()
 
             step += 1
 
             if is_main and step % config.log_every == 0:
                 avg_loss = running_loss / config.log_every
-                print(f"Step {step}/{config.num_train_steps} | Loss: {avg_loss:.4f}")
+                lr_now = scheduler.get_last_lr()[0]
+                print(f"Step {step}/{config.num_train_steps} | Loss: {avg_loss:.4f} | LR: {lr_now:.2e}")
                 running_loss = 0.0
 
             if is_main and step % config.val_every == 0:

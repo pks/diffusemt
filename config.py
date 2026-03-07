@@ -3,11 +3,11 @@ from dataclasses import dataclass
 
 @dataclass
 class Config:
-    # Model (BERT-large sized)
-    embed_dim: int = 1024
-    num_heads: int = 16
-    num_layers: int = 28
-    ff_dim: int = 4096
+    # Model (smaller, for faster iteration)
+    embed_dim: int = 512
+    num_heads: int = 8
+    num_layers: int = 8
+    ff_dim: int = 2048
     dropout: float = 0.1
     max_seq_len: int = 128
 
@@ -22,11 +22,12 @@ class Config:
     batch_size: int = 64
     grad_accum_steps: int = 6
     lr: float = 2e-4
+    warmup_steps: int = 2000
     num_train_steps: int = 50000
     log_every: int = 100
     val_every: int = 2500
     save_every: int = 5000
-    checkpoint_dir: str = "checkpoints_v7"
+    checkpoint_dir: str = "checkpoints_v8"
 
     # Data
     tokenizer_name: str = "bert-base-multilingual-cased"
