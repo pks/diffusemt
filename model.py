@@ -61,7 +61,8 @@ class DiffusionTransformer(nn.Module):
         )
         self.target_decoder = nn.TransformerDecoder(decoder_layer, num_layers=num_layers)
 
-        # Output projection: predict clean embeddings
+        # Output: LayerNorm + projection to predict clean embeddings
+        self.output_norm = nn.LayerNorm(embed_dim)
         self.output_proj = nn.Linear(embed_dim, embed_dim)
 
     def encode_source(self, source_ids, source_mask):
@@ -107,4 +108,4 @@ class DiffusionTransformer(nn.Module):
         )
 
         # Predict clean embeddings
-        return self.output_proj(decoded)
+        return self.output_proj(self.output_norm(decoded))

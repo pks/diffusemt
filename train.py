@@ -1,4 +1,7 @@
 import os
+import sys
+import argparse
+import json
 import torch
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
@@ -90,7 +93,66 @@ def enable_gradient_checkpointing(model):
         layer.forward = make_ckpt_forward(original_forward)
 
 
-def train():
+@torch.no_grad()
+def health_check(model, raw_model, diffusion, config, device, emb_scale,
+                 dataloader_iter, dataloader, sampler, epoch):
+    """Check for mode collapse and measure per-timestep accuracy.
+
+    Returns a dict with diagnostics. Aborts training if collapse detected.
+    """
+    model.eval()
+
+    # Get a batch
+    try:
+        batch = next(dataloader_iter)
+    except StopIteration:
+        if sampler is not None:
+            sampler.set_epoch(epoch)
+        dataloader_iter = iter(dataloader)
+        batch = next(dataloader_iter)
+
+    source_ids = batch["source_ids"].to(device)
+    source_mask = batch["source_mask"].to(device)
+    target_ids = batch["target_ids"].to(device)
+    target_mask = batch["target_mask"].to(device)
+
+    x0 = raw_model.token_embedding(target_ids) / emb_scale
+    emb_weight = raw_model.token_embedding.weight.data
+    B = x0.shape[0]
+
+    results = {}
+    for t_val in [0, config.timesteps // 4, config.timesteps // 2,
+                  3 * config.timesteps // 4, config.timesteps - 1]:
+        t = torch.full((B,), t_val, device=device, dtype=torch.long)
+        xt, _ = diffusion.q_sample(x0, t)
+
+        with torch.amp.autocast("cuda", dtype=torch.float16):
+            pred_x0 = model(source_ids, source_mask, xt, t)
+
+        # Token matching on CPU to avoid OOM from (B, T, V) distance matrix
+        pred_cpu = (pred_x0.float() * emb_scale).cpu()
+        emb_cpu = emb_weight.cpu().float()
+        token_ids = torch.cdist(pred_cpu, emb_cpu.unsqueeze(0), p=2).argmin(dim=-1)
+        real_mask = target_mask.bool().cpu()
+        target_cpu = target_ids.cpu()
+        acc = (token_ids[real_mask] == target_cpu[real_mask]).float().mean().item()
+
+        # Check unique tokens predicted (collapse = 1-2 unique tokens)
+        n_unique = token_ids[real_mask].unique().numel()
+
+        results[f"t{t_val}_acc"] = acc
+        results[f"t{t_val}_unique"] = n_unique
+
+    model.train()
+
+    # Collapse detection: if t=0 (clean input) has <5 unique tokens, it's collapsed
+    t0_unique = results.get(f"t0_unique", 0)
+    collapsed = t0_unique < 5
+
+    return results, collapsed
+
+
+def train(resume_from=None):
     config = Config()
 
     # DDP setup
@@ -162,14 +224,50 @@ def train():
     # Compute embedding scale factor (normalize to unit per-dim variance for diffusion)
     with torch.no_grad():
         emb_scale = raw_model.token_embedding.weight.std().item()
+
+    # Resume from checkpoint
+    step = 0
+    epoch = 0
+    if resume_from is not None:
+        ckpt = torch.load(resume_from, map_location="cpu", weights_only=False)
+        raw_model.load_state_dict(ckpt["model"])
+        optimizer.load_state_dict(ckpt["optimizer"])
+        step = ckpt["step"]
+        emb_scale = ckpt.get("emb_scale", emb_scale)
+        # Move optimizer state to device
+        for state in optimizer.state.values():
+            for k, v in state.items():
+                if isinstance(v, torch.Tensor):
+                    state[k] = v.to(device)
+        # Advance scheduler to match resumed step
+        for _ in range(step // config.grad_accum_steps):
+            scheduler.step()
+        del ckpt
+        if is_main:
+            print(f"Resumed from checkpoint at step {step}")
+
     if is_main:
         print(f"Embedding scale factor: {emb_scale:.2f}")
 
+    # Health check interval: first few checks early, then at val_every
+    health_check_steps = {500, 1000, 2000, 5000}
+
+    # Log file for structured metrics
+    log_path = os.path.join(config.checkpoint_dir, "metrics.jsonl")
+
+    def log_metrics(metrics):
+        if is_main:
+            with open(log_path, "a") as f:
+                f.write(json.dumps(metrics) + "\n")
+
+    # Loss plateau detection
+    loss_window = []
+    PLATEAU_WINDOW = 20  # number of log intervals
+    PLATEAU_THRESHOLD = 0.005  # if max-min < threshold over window, plateau
+
     # Training loop
     model.train()
-    step = 0
     running_loss = 0.0
-    epoch = 0
 
     while step < config.num_train_steps:
         if sampler is not None:
@@ -236,12 +334,45 @@ def train():
                 avg_loss = running_loss / config.log_every
                 lr_now = scheduler.get_last_lr()[0]
                 print(f"Step {step}/{config.num_train_steps} | Loss: {avg_loss:.4f} | LR: {lr_now:.2e}")
+                log_metrics({"step": step, "train_loss": round(avg_loss, 4), "lr": lr_now})
                 running_loss = 0.0
+
+                # Plateau detection
+                loss_window.append(avg_loss)
+                if len(loss_window) > PLATEAU_WINDOW:
+                    loss_window.pop(0)
+                if len(loss_window) == PLATEAU_WINDOW and step > config.warmup_steps * config.grad_accum_steps:
+                    spread = max(loss_window) - min(loss_window)
+                    if spread < PLATEAU_THRESHOLD:
+                        print(f"WARNING: Loss plateau detected (spread={spread:.4f} over {PLATEAU_WINDOW} intervals)")
+                        log_metrics({"step": step, "event": "plateau_warning", "spread": round(spread, 4)})
+
+            # Health check: early steps + at validation intervals
+            if is_main and (step in health_check_steps or step % config.val_every == 0):
+                hc_results, collapsed = health_check(
+                    model, raw_model, diffusion, config, device, emb_scale,
+                    iter(dataloader), dataloader, sampler, epoch)
+                t0_key = f"t0_acc"
+                tmax_key = f"t{config.timesteps - 1}_acc"
+                print(f"Step {step} | Health: t=0 acc={hc_results.get(t0_key, 0):.2%} "
+                      f"unique={hc_results.get('t0_unique', 0)}, "
+                      f"t={config.timesteps-1} acc={hc_results.get(tmax_key, 0):.2%} "
+                      f"unique={hc_results.get(f't{config.timesteps-1}_unique', 0)}")
+                log_metrics({"step": step, "event": "health_check", **hc_results})
+
+                if collapsed:
+                    print(f"FATAL: Mode collapse detected at step {step}! "
+                          f"t=0 unique tokens = {hc_results.get('t0_unique', 0)}. Aborting.")
+                    log_metrics({"step": step, "event": "collapse_abort"})
+                    if distributed:
+                        cleanup_ddp()
+                    sys.exit(1)
 
             if is_main and step % config.val_every == 0:
                 val_loss = validate(model, raw_model, diffusion, val_dataloader,
                                     config, device, emb_scale)
                 print(f"Step {step} | Val Loss: {val_loss:.4f}")
+                log_metrics({"step": step, "val_loss": round(val_loss, 4)})
 
             if is_main and step % config.save_every == 0:
                 path = os.path.join(config.checkpoint_dir, f"model_step_{step}.pt")
@@ -271,4 +402,7 @@ def train():
 
 
 if __name__ == "__main__":
-    train()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--resume", type=str, default=None, help="Path to checkpoint to resume from")
+    args = parser.parse_args()
+    train(resume_from=args.resume)
