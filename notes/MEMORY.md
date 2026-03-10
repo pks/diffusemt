@@ -12,10 +12,11 @@ Codebase: ~1000 lines Python. Key files: config.py, model.py, diffusion.py, trai
 
 ## Two Critical Unsolved Problems
 
-### 1. Mode Collapse at Scale
-Only 512d/8L (~115M) avoids collapse. All larger models (768d, 1024d, deeper 512d)
-collapse to predicting a single token for all positions. Tried varying lr (3e-5 to 2e-4),
-warmup (2K-10K), LayerNorm, anchor loss — none helped. This is the primary blocker.
+### 1. Mode Collapse — Caused by T=50, Not Model Size
+**CRITICAL**: The baseline_test proved that 512d/8L with T=50 ALSO collapses.
+The only non-collapsing run (v8) used T=200. ALL T=50 runs collapsed regardless of size.
+T=200 is necessary but not sufficient — large models (v6/v7) collapsed with T=200 too,
+but those had other bugs. Next step: re-run larger models with T=200 + all current fixes.
 See [training_history.md](training_history.md) for full collapse matrix.
 
 ### 2. Can't Generate From Noise
@@ -24,7 +25,8 @@ accuracy at t<120) but can't generate from pure noise (5% at t=199). Reverse dif
 starts from pure noise, so output is garbage. Infilling also fails.
 Trained up to 150K steps (v9), t>180 accuracy didn't improve.
 
-## Training Recipe (proven for 512d/8L only)
+## Training Recipe (proven for 512d/8L/T=200 only)
+- **T=200 timesteps minimum** — T=50 causes universal collapse
 - x0 prediction (model predicts clean embeddings, not noise)
 - emb_scale = weight.std() (~1.0)
 - Cosine noise schedule: alpha_bar = cos(pi/2 * t/T)^2

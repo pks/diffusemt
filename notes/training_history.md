@@ -21,6 +21,7 @@
 | v11c | checkpoints_v11c/ | 768d/12L/T50 | 294M | 500 | 0.85 | lr=2e-4/warmup2K (same as v8), collapse |
 | v12 | checkpoints_v12/ | 768d/12L/T50 | 294M | 500 | 0.93 | +LayerNorm+anchor loss, still collapsed |
 | v12b | checkpoints_v12b/ | 512d/24L/T50 | ~340M | 500 | 0.85 | Deeper 512d, still collapsed |
+| baseline_test | checkpoints_baseline_test/ | 512d/8L/T50 | ~115M | 500 | - | **COLLAPSED** — same as v8 but T=50 instead of T=200 |
 
 ## Bug Fixes Applied (cumulative)
 
@@ -38,34 +39,39 @@
 - **eval.py**: per-timestep accuracy, translation, infilling, quantitative infilling accuracy
 - **metrics.jsonl**: structured logging in checkpoint dir
 
-## Critical Finding: Mode Collapse Scales With Model Size
+## CRITICAL FINDING: T=50 Causes Mode Collapse (NOT Model Size)
 
-**Only 512d/8L (~115M params) avoids mode collapse.** Every larger configuration collapses:
+**CORRECTION**: The earlier hypothesis that "only 512d/8L avoids collapse" was WRONG.
+The baseline_test run proved that 512d/8L with T=50 ALSO collapses at step 500 (4 unique tokens).
 
-| Config | Params | lr | Warmup | Collapsed? |
-|--------|--------|----|--------|------------|
-| 512d/8L | 115M | 2e-4 | 2K | NO |
-| 512d/24L | 340M | 2e-4 | 2K | YES (step 500) |
-| 768d/12L | 294M | 2e-4 | 2K | YES (step 500) |
-| 768d/12L | 294M | 1e-4 | 10K | YES (step 500) |
-| 768d/12L | 294M | 3e-5 | 10K | YES (step 1000) |
-| 768d/12L+LN+anchor | 294M | 2e-4 | 2K | YES (step 500) |
-| 1024d/28L | 951M | 2e-4 | 2K | YES (plateaued) |
-| 1024d/28L | 951M | 1e-4 | 10K | YES (5 step/min, too slow) |
+The ONLY run that avoided collapse was v8: 512d/8L with **T=200**. ALL T=50 runs collapsed:
 
-This is NOT a hyperparameter issue — collapse happens at every lr and warmup tested.
-LayerNorm and anchor loss also didn't help.
+| Config | Params | T | lr | Warmup | Collapsed? |
+|--------|--------|---|-----|--------|------------|
+| 512d/8L | 115M | **200** | 2e-4 | 2K | **NO** (only survivor) |
+| 512d/8L | 115M | **50** | 2e-4 | 2K | **YES** (step 500) — baseline_test |
+| 512d/24L | 340M | 50 | 2e-4 | 2K | YES (step 500) |
+| 768d/12L | 294M | 50 | 2e-4 | 2K | YES (step 500) |
+| 768d/12L | 294M | 50 | 1e-4 | 10K | YES (step 500) |
+| 768d/12L | 294M | 50 | 3e-5 | 10K | YES (step 1000) |
+| 768d/12L+LN+anchor | 294M | 50 | 2e-4 | 2K | YES (step 500) |
+| 1024d/28L | 951M | 50 | 2e-4 | 2K | YES (plateaued) |
+| 1024d/28L | 951M | 50 | 1e-4 | 10K | YES (5 step/min, too slow) |
+
+Note: v6/v7/v7b (T=200, large models) also collapsed, so T=200 is necessary but not sufficient.
+The interaction is: T=50 collapses everything; T=200 gives larger models a chance but they
+still collapse (possibly due to separate model-size issues).
 
 The collapse pattern: model predicts a single token for all positions at all timesteps,
 even for clean input (t=0). Unique token count drops to 1-5.
 
-**Possible root causes to investigate:**
-- Embedding dimension vs vocab size ratio: 512d/120K vocab = 0.004 dims per token,
-  768d/120K = 0.006. Larger models may have more capacity to overfit the mean.
-- The MSE loss landscape may have a stronger collapse attractor in higher dimensions.
-- Self-conditioning might amplify collapse: if first prediction collapses, self-cond
-  reinforces it.
-- Gradient checkpointing interaction with larger models.
+**Root cause analysis:**
+- T=50 with cosine schedule means huge noise jumps between steps — the model can't
+  learn the gradual denoising trajectory.
+- With T=200, smaller models (512d/8L) can learn, but larger models still collapse —
+  likely due to the MSE loss landscape having a stronger collapse attractor in higher dimensions.
+- Self-conditioning may amplify collapse: if first prediction collapses, self-cond reinforces it.
+- Gradient checkpointing interaction with larger models is also possible.
 
 ## v8/v9 Inference Analysis
 
@@ -90,13 +96,15 @@ filled with garbage. The reverse diffusion process itself is broken for generati
 
 ## Recommendations for Next Machine (Beefier GPUs)
 
-1. **Investigate collapse root cause** before scaling up — it's not just lr/warmup
-2. **Try disabling self-conditioning** for larger models (might amplify collapse)
-3. **Try different output head**: e.g., predict logits then lookup embeddings instead
+1. **Use T=200 (or higher), NOT T=50** — T=50 causes universal collapse. This is the #1 lesson.
+2. **Try scaling up with T=200**: v6/v7 collapsed at 1024d/28L/T=200, but those runs had
+   other bugs (v6 had emb_scale issues, v7 was early). Re-run 768d or 1024d with T=200
+   and all current fixes (cosine schedule, min-SNR, LayerNorm, health checks).
+3. **Try disabling self-conditioning** for larger models (might amplify collapse)
+4. **Try different output head**: e.g., predict logits then lookup embeddings instead
    of directly predicting embedding vectors
-4. **Consider freezing token_embedding** during training (it gets optimizer updates
+5. **Consider freezing token_embedding** during training (it gets optimizer updates
    even though x0 target is detached)
-5. **Try progressive growing**: train 512d/8L, then expand to wider model
-6. **Reduce timesteps** (T=50 instead of 200) was already done, didn't help collapse
+6. **Try T=500 or T=1000** — if T=200 helps vs T=50, more timesteps might help further
 7. If generation from noise stays broken, consider **non-autoregressive MT**
    approaches like CMLM that don't require starting from pure noise
