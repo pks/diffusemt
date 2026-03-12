@@ -1,6 +1,11 @@
 # Training History
 
-## Version Summary
+## Phase 1: Continuous Diffusion (v1-v12b, baseline_test)
+
+Continuous Gaussian diffusion over token embeddings. Model predicts clean embeddings (x0),
+nearest-neighbor lookup converts back to tokens. Encoder-decoder architecture.
+
+### Version Summary (Continuous)
 
 | Ver | Dir | Config | Params | Steps | Final Loss | Result |
 |-----|-----|--------|--------|-------|------------|--------|
@@ -23,8 +28,98 @@
 | v12b | checkpoints_v12b/ | 512d/24L/T50 | ~340M | 500 | 0.85 | Deeper 512d, still collapsed |
 | baseline_test | checkpoints_baseline_test/ | 512d/8L/T50 | ~115M | 500 | - | **COLLAPSED** — same as v8 but T=50 instead of T=200 |
 
-## Bug Fixes Applied (cumulative)
+### Continuous Diffusion Findings
 
+**T=50 causes universal collapse.** The only surviving run (v8) used T=200.
+v8/v9 trained well but can't generate from pure noise (5% accuracy at t=199).
+Continuous diffusion abandoned due to these two unsolvable problems.
+
+---
+
+## Phase 2: Discrete Diffusion (v13+)
+
+**Forked from continuous at this point.** Switched to absorbing-state (mask-based) discrete
+diffusion. Motivation: avoids the embedding→token projection gap and starts from [MASK]
+tokens instead of pure Gaussian noise.
+
+### Architecture: Approach C (Hybrid)
+- **Encoder-only** bidirectional transformer (no encoder-decoder split)
+- Input: `[source tokens | corrupted target tokens]` concatenated
+- Source tokens are **never masked** — always visible as context
+- Target tokens are masked by diffusion process (replace with [MASK])
+- Segment embeddings (0=source, 1=target) distinguish the two halves
+- Source and target can have **different lengths** (both padded to max_seq_len=128)
+- Output: softmax over vocab, cross-entropy loss on masked target positions
+- Confidence-based unmasking during inference (unmask most-confident first)
+
+### Three Approaches Considered (see discrete_diffusion.md)
+- **A. Mask-only**: standard MDLM-style, concat [src|tgt], mask target
+- **B. Source-as-corruption**: replace target tokens with source tokens (same length required)
+- **C. Hybrid** (chosen): concat [src|tgt], source always visible, target masked. Different lengths OK.
+
+### Version Summary (Discrete)
+
+| Ver | Dir | Config | Tokenizer | lr | Extras | Steps | Result |
+|-----|-----|--------|-----------|-----|--------|-------|--------|
+| v13 (1st) | checkpoints_v13_discrete/ | 512d/8L, tied, T=200 | mbert-120K | 2e-4 | - | 2000 | Collapsed at step 2000 (LR hit peak) |
+| v13 (2nd) | checkpoints_v13_discrete/ | 512d/8L, tied, T=200 | mbert-120K | 1e-4 | - | 12500 | **Best run.** Collapsed at step 12500 when LR hit full value. t=200 acc reached 14%, val_loss 7.85 |
+| v14 | checkpoints_v14_cosine_decay/ | 512d/8L, tied, T=200 | mbert-120K | 1e-4 | cosine decay | 5000 | Collapsed step 5000 (still in warmup, decay hadn't kicked in) |
+| v15 | checkpoints_v15_untied/ | 512d/8L, **untied**, T=200 | mbert-120K | 1e-4 | cosine decay | 1000 | Collapsed step 1000 — untied is worse (148M params, bigger = faster collapse) |
+| v16 | checkpoints_v16_smooth/ | 512d/8L, tied, T=200 | mbert-120K | 3e-5 | cosine decay + label_smooth=0.1 | 5000 | Collapsed step 5000 — lower LR + smoothing didn't help |
+| v17 | checkpoints_v17_smallvocab/ | 512d/8L, tied, T=200 | bert-cased-29K | 3e-5 | cosine decay + label_smooth=0.1 | 500 | Collapsed step 500 — smaller vocab made it worse |
+
+### Key Bug Fix: Logit Scaling for Tied Embeddings
+With tied output weights (`output_proj.weight = token_embedding.weight`), logits have
+std ≈ sqrt(embed_dim) ≈ 22.6 for d=512. This blows up the softmax and gives initial CE
+loss of ~98 (vs expected ~11.7). Fix: divide logits by `sqrt(embed_dim)`.
+
+### v13 (2nd run) Detailed Trajectory — Best Discrete Run
+| Step | Loss | t=1 acc | t=200 acc | t=200 unique | Val Loss |
+|------|------|---------|-----------|--------------|----------|
+| 500 | 11.09 | 100% | 4.9% | 3 | - |
+| 1000 | 10.34 | 100% | 7.3% | 4 | - |
+| 2000 | 10.05 | 100% | 8.8% | 7 | - |
+| 2500 | 9.92 | 100% | 9.3% | 8 | 9.84 |
+| 5000 | 9.34 | 100% | 11.8% | 11 | 9.34 |
+| 7500 | 8.63 | 100% | 12.7% | 25 | 8.63 |
+| 10000 | 7.85 | 100% | 13.3% | 34 | 7.85 |
+| 12500 | - | **0% (1 unique)** | 13.8% | 55 | - | COLLAPSED |
+
+Collapse always happens at t=1 (almost no masking) — the model suddenly predicts a
+single token for all positions even when input is barely corrupted. t=200 accuracy
+was actually improving at the time of collapse.
+
+### Discrete Collapse Analysis
+
+**Pattern**: Every discrete run eventually collapses. The collapse correlates with
+LR magnitude — higher LR = earlier collapse. But even lr=3e-5 collapsed.
+
+Attempted fixes that didn't work:
+- Lower LR (2e-4 → 1e-4 → 3e-5): delayed but didn't prevent collapse
+- Cosine LR decay: collapsed before decay kicked in
+- Untied output weights: made it worse (more params = faster collapse)
+- Label smoothing (0.1): no effect
+- Smaller vocab (120K → 29K): made it worse
+
+**Hypothesis**: The tied embedding creates a feedback loop. The CE loss gradient
+updates the embedding table, which also provides the input representations. As the
+model improves, it pushes embeddings apart to create sharper predictions, which
+destabilizes the input distribution. The 1/sqrt(d) logit scaling helps but doesn't
+fully prevent this.
+
+### Possible Next Steps for Discrete
+1. **Freeze token_embedding** — only train output_proj (untied) and transformer layers
+2. **Use pretrained embeddings** — initialize from BERT and freeze
+3. **Separate input/output embeddings** — untied but with smaller output projection
+   (e.g., project to 256d first, then to vocab)
+4. **Different architecture**: try a standard pretrained model (e.g., mBART) with
+   masking-based fine-tuning instead of training from scratch
+5. **Revisit approach B** (source-as-corruption): the collapse might be specific to
+   the concatenation approach
+
+## Infrastructure (applies to both phases)
+
+### Bug Fixes Applied (cumulative, continuous phase)
 1. **emb_scale** (v5): `weight.norm(dim=-1).mean()` -> `weight.std()` (~32 -> ~1.0)
 2. **x0 prediction** (v6): changed loss from epsilon to x0 target
 3. **Cosine schedule** (v7): `alpha_bar = cos(pi/2 * t/T)^2`
@@ -33,78 +128,14 @@
 6. **LR warmup** (v8): linear warmup over 2000 optimizer steps
 7. **Output LayerNorm** (v12): nn.LayerNorm before output_proj
 
-## Infrastructure Added
-- **train.py --resume**: checkpoint resumption with optimizer state
-- **Health checks**: auto collapse detection at steps 500/1K/2K/5K + every val_every
-- **eval.py**: per-timestep accuracy, translation, infilling, quantitative infilling accuracy
-- **metrics.jsonl**: structured logging in checkpoint dir
+### Code Features
+- `train.py --resume <ckpt>`: checkpoint resumption with optimizer state
+- Auto collapse detection: health checks at steps 500/1K/2K/5K + every val_every
+- `eval.py --checkpoint <ckpt>`: per-timestep accuracy, translation, infilling eval
+- Structured metrics in `<checkpoint_dir>/metrics.jsonl`
 
-## CRITICAL FINDING: T=50 Causes Mode Collapse (NOT Model Size)
-
-**CORRECTION**: The earlier hypothesis that "only 512d/8L avoids collapse" was WRONG.
-The baseline_test run proved that 512d/8L with T=50 ALSO collapses at step 500 (4 unique tokens).
-
-The ONLY run that avoided collapse was v8: 512d/8L with **T=200**. ALL T=50 runs collapsed:
-
-| Config | Params | T | lr | Warmup | Collapsed? |
-|--------|--------|---|-----|--------|------------|
-| 512d/8L | 115M | **200** | 2e-4 | 2K | **NO** (only survivor) |
-| 512d/8L | 115M | **50** | 2e-4 | 2K | **YES** (step 500) — baseline_test |
-| 512d/24L | 340M | 50 | 2e-4 | 2K | YES (step 500) |
-| 768d/12L | 294M | 50 | 2e-4 | 2K | YES (step 500) |
-| 768d/12L | 294M | 50 | 1e-4 | 10K | YES (step 500) |
-| 768d/12L | 294M | 50 | 3e-5 | 10K | YES (step 1000) |
-| 768d/12L+LN+anchor | 294M | 50 | 2e-4 | 2K | YES (step 500) |
-| 1024d/28L | 951M | 50 | 2e-4 | 2K | YES (plateaued) |
-| 1024d/28L | 951M | 50 | 1e-4 | 10K | YES (5 step/min, too slow) |
-
-Note: v6/v7/v7b (T=200, large models) also collapsed, so T=200 is necessary but not sufficient.
-The interaction is: T=50 collapses everything; T=200 gives larger models a chance but they
-still collapse (possibly due to separate model-size issues).
-
-The collapse pattern: model predicts a single token for all positions at all timesteps,
-even for clean input (t=0). Unique token count drops to 1-5.
-
-**Root cause analysis:**
-- T=50 with cosine schedule means huge noise jumps between steps — the model can't
-  learn the gradual denoising trajectory.
-- With T=200, smaller models (512d/8L) can learn, but larger models still collapse —
-  likely due to the MSE loss landscape having a stronger collapse attractor in higher dimensions.
-- Self-conditioning may amplify collapse: if first prediction collapses, self-cond reinforces it.
-- Gradient checkpointing interaction with larger models is also possible.
-
-## v8/v9 Inference Analysis
-
-v8 (50K) and v9 (150K) both produce garbage translations despite low training loss.
-
-**Per-timestep accuracy (v9 @ 150K):**
-| Timestep | Token Accuracy |
-|----------|---------------|
-| 0-120 | 100% |
-| 150 | 94.8% |
-| 160 | 91.9% |
-| 170 | 79.7% |
-| 180 | 51.6% |
-| 190 | 14.6% |
-| 199 | 5.8% |
-
-Model is excellent denoiser but can't generate from pure noise.
-More training (50K→150K) improved mid-range (t=150-170) but t>180 stayed flat.
-
-**Infilling also fails**: even with prefix+suffix context, the 5-token gaps are
-filled with garbage. The reverse diffusion process itself is broken for generation.
-
-## Recommendations for Next Machine (Beefier GPUs)
-
-1. **Use T=200 (or higher), NOT T=50** — T=50 causes universal collapse. This is the #1 lesson.
-2. **Try scaling up with T=200**: v6/v7 collapsed at 1024d/28L/T=200, but those runs had
-   other bugs (v6 had emb_scale issues, v7 was early). Re-run 768d or 1024d with T=200
-   and all current fixes (cosine schedule, min-SNR, LayerNorm, health checks).
-3. **Try disabling self-conditioning** for larger models (might amplify collapse)
-4. **Try different output head**: e.g., predict logits then lookup embeddings instead
-   of directly predicting embedding vectors
-5. **Consider freezing token_embedding** during training (it gets optimizer updates
-   even though x0 target is detached)
-6. **Try T=500 or T=1000** — if T=200 helps vs T=50, more timesteps might help further
-7. If generation from noise stays broken, consider **non-autoregressive MT**
-   approaches like CMLM that don't require starting from pure noise
+## Data
+- **WMT14 EN→DE**, 4.5M training pairs
+- Tokenized versions:
+  - `data/wmt14_en_de_tokenized[_test]` — bert-base-multilingual-cased (120K vocab)
+  - `data/wmt14_en_de_bert_cased[_test]` — bert-base-cased (29K vocab)

@@ -21,26 +21,24 @@ class SinusoidalTimestepEmbedding(nn.Module):
 
 class DiffusionTransformer(nn.Module):
     """
-    Transformer denoiser for diffusion MT.
+    Encoder-only transformer for discrete diffusion MT.
 
-    Takes noisy target embeddings + source tokens + timestep,
-    predicts clean target embeddings (x0-prediction).
+    Input: [source tokens | corrupted target tokens] as a single sequence.
+    Source tokens are never masked. Target tokens are masked by the diffusion process.
+    Segment embeddings distinguish source (0) from target (1).
+    Output: logits over vocabulary for each position.
     """
 
     def __init__(self, vocab_size, embed_dim=256, num_heads=4, num_layers=4,
-                 ff_dim=1024, dropout=0.1, max_seq_len=128):
+                 ff_dim=1024, dropout=0.1, max_seq_len=256):
         super().__init__()
         self.embed_dim = embed_dim
+        self.vocab_size = vocab_size
 
-        # Source encoder
+        # Token + position + segment embeddings
         self.token_embedding = nn.Embedding(vocab_size, embed_dim)
         self.position_embedding = nn.Embedding(max_seq_len, embed_dim)
-
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=embed_dim, nhead=num_heads, dim_feedforward=ff_dim,
-            dropout=dropout, batch_first=True,
-        )
-        self.source_encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+        self.segment_embedding = nn.Embedding(2, embed_dim)  # 0=source, 1=target
 
         # Timestep embedding
         self.time_embed = SinusoidalTimestepEmbedding(embed_dim)
@@ -50,62 +48,43 @@ class DiffusionTransformer(nn.Module):
             nn.Linear(embed_dim, embed_dim),
         )
 
-        # Target (noisy embeddings + self-conditioning) projection
-        # Input: noisy_target (embed_dim) concatenated with x0_self_cond (embed_dim)
-        self.target_input_proj = nn.Linear(embed_dim * 2, embed_dim)
-
-        # Target decoder (cross-attends to source)
-        decoder_layer = nn.TransformerDecoderLayer(
+        # Bidirectional transformer encoder
+        encoder_layer = nn.TransformerEncoderLayer(
             d_model=embed_dim, nhead=num_heads, dim_feedforward=ff_dim,
             dropout=dropout, batch_first=True,
         )
-        self.target_decoder = nn.TransformerDecoder(decoder_layer, num_layers=num_layers)
+        self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
 
-        # Output: LayerNorm + projection to predict clean embeddings
+        # Output head: predict token logits
         self.output_norm = nn.LayerNorm(embed_dim)
-        self.output_proj = nn.Linear(embed_dim, embed_dim)
+        self.output_proj = nn.Linear(embed_dim, vocab_size, bias=False)
 
-    def encode_source(self, source_ids, source_mask):
-        """Encode source tokens."""
-        B, S = source_ids.shape
-        positions = torch.arange(S, device=source_ids.device).unsqueeze(0)
-        x = self.token_embedding(source_ids) + self.position_embedding(positions)
-        # TransformerEncoder expects src_key_padding_mask: True = ignore
-        memory = self.source_encoder(x, src_key_padding_mask=~source_mask)
-        return memory
+        # Tie output projection weights to token embedding
+        self.output_proj.weight = self.token_embedding.weight
 
-    def forward(self, source_ids, source_mask, noisy_target, t, x0_self_cond=None):
+    def forward(self, input_ids, padding_mask, segment_ids, t):
         """
         Args:
-            source_ids: (B, S) source token IDs
-            source_mask: (B, S) bool mask (True = valid token)
-            noisy_target: (B, T_len, embed_dim) noisy target embeddings
+            input_ids: (B, S+T) concatenated [source | corrupted_target] token IDs
+            padding_mask: (B, S+T) bool mask (True = valid, False = padding)
+            segment_ids: (B, S+T) 0 for source positions, 1 for target positions
             t: (B,) timestep indices
-            x0_self_cond: (B, T_len, embed_dim) previous x0 prediction for
-                          self-conditioning, or None (uses zeros)
         Returns:
-            predicted_x0: (B, T_len, embed_dim) predicted clean embeddings
+            logits: (B, S+T, vocab_size) predicted token logits
         """
-        # Encode source
-        memory = self.encode_source(source_ids, source_mask)
+        B, L = input_ids.shape
+        positions = torch.arange(L, device=input_ids.device).unsqueeze(0)
 
-        # Process noisy target with self-conditioning
-        B, T_len, _ = noisy_target.shape
-        if x0_self_cond is None:
-            x0_self_cond = torch.zeros_like(noisy_target)
-        target_input = torch.cat([noisy_target, x0_self_cond], dim=-1)  # (B, T, 2*D)
-
-        positions = torch.arange(T_len, device=noisy_target.device).unsqueeze(0)
-        target = self.target_input_proj(target_input) + self.position_embedding(positions)
+        x = (self.token_embedding(input_ids)
+             + self.position_embedding(positions)
+             + self.segment_embedding(segment_ids))
 
         # Add timestep embedding (broadcast to all positions)
         t_emb = self.time_proj(self.time_embed(t))  # (B, embed_dim)
-        target = target + t_emb.unsqueeze(1)
+        x = x + t_emb.unsqueeze(1)
 
-        # Decode with cross-attention to source
-        decoded = self.target_decoder(
-            target, memory, memory_key_padding_mask=~source_mask
-        )
+        # Bidirectional self-attention over full sequence
+        x = self.encoder(x, src_key_padding_mask=~padding_mask)
 
-        # Predict clean embeddings
-        return self.output_proj(self.output_norm(decoded))
+        # Predict token logits (scale for tied embeddings)
+        return self.output_proj(self.output_norm(x)) / (self.embed_dim ** 0.5)

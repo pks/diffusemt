@@ -3,34 +3,33 @@ from dataclasses import dataclass
 
 @dataclass
 class Config:
-    # Model (512d/8L — baseline that works)
+    # Model
     embed_dim: int = 512
     num_heads: int = 8
     num_layers: int = 8
     ff_dim: int = 2048
     dropout: float = 0.1
-    max_seq_len: int = 128
+    max_seq_len: int = 128  # per side (source or target)
 
     # Diffusion
-    timesteps: int = 50
-    beta_start: float = 1e-4
-    beta_end: float = 0.02
+    timesteps: int = 200
     schedule: str = "cosine"
-    min_snr_gamma: float = 5.0
+    mask_token_id: int = 103  # [MASK] for bert-base-multilingual-cased
 
     # Training
     batch_size: int = 64
     grad_accum_steps: int = 6
-    lr: float = 2e-4
+    lr: float = 3e-5
     warmup_steps: int = 2000
-    num_train_steps: int = 5000
+    label_smoothing: float = 0.1
+    num_train_steps: int = 50000
     log_every: int = 50
     val_every: int = 2500
-    save_every: int = 5000
-    checkpoint_dir: str = "checkpoints_baseline_test"
+    save_every: int = 10000
+    checkpoint_dir: str = "checkpoints_v17_smallvocab"
 
     # Data
-    tokenizer_name: str = "bert-base-multilingual-cased"
+    tokenizer_name: str = "bert-base-cased"
     dataset_name: str = "wmt14"
     dataset_config: str = "de-en"
     src_lang: str = "en"

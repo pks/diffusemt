@@ -10,45 +10,49 @@ Codebase: ~1000 lines Python. Key files: config.py, model.py, diffusion.py, trai
 - `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` required for large models
 - User is moving to a beefier GPU machine
 
-## Two Critical Unsolved Problems
+## Current Status: Discrete Diffusion (v13-v17), All Collapsed
 
-### 1. Mode Collapse — Caused by T=50, Not Model Size
-**CRITICAL**: The baseline_test proved that 512d/8L with T=50 ALSO collapses.
-The only non-collapsing run (v8) used T=200. ALL T=50 runs collapsed regardless of size.
-T=200 is necessary but not sufficient — large models (v6/v7) collapsed with T=200 too,
-but those had other bugs. Next step: re-run larger models with T=200 + all current fixes.
-See [training_history.md](training_history.md) for full collapse matrix.
+### Phase 1: Continuous Diffusion (v1-v12b) — ABANDONED
+- Only 512d/8L with T=200 (v8) avoided collapse, but can't generate from noise (5% at t=199)
+- T=50 causes universal collapse; larger models collapse even with T=200
 
-### 2. Can't Generate From Noise
-Even the working 512d/8L model can't translate — it's a good denoiser (100% token
-accuracy at t<120) but can't generate from pure noise (5% at t=199). Reverse diffusion
-starts from pure noise, so output is garbage. Infilling also fails.
-Trained up to 150K steps (v9), t>180 accuracy didn't improve.
+### Phase 2: Discrete Diffusion (v13+) — CURRENT
+Switched to absorbing-state mask-based diffusion. Architecture: encoder-only transformer,
+[source | masked_target] concatenated, segment embeddings, cross-entropy loss.
+See [discrete_diffusion.md](discrete_diffusion.md) for approach design.
 
-## Training Recipe (proven for 512d/8L/T=200 only)
-- **T=200 timesteps minimum** — T=50 causes universal collapse
-- x0 prediction (model predicts clean embeddings, not noise)
-- emb_scale = weight.std() (~1.0)
-- Cosine noise schedule: alpha_bar = cos(pi/2 * t/T)^2
-- Min-SNR loss weighting: gamma=5.0
-- LR warmup: 2000 optimizer steps linear warmup
-- Per-sample MSE / embed_dim normalization
-- Per-layer gradient checkpointing, AMP fp16 + GradScaler
-- Output LayerNorm before projection (added v12, kept)
+**All discrete runs collapse.** Best run (v13, lr=1e-4) survived 12.5K steps with
+t=200 acc reaching 14% before collapsing. Collapse always hits t=1 first (easy task).
 
-## Code Features
-- `train.py --resume <ckpt>`: checkpoint resumption with optimizer state
-- Auto collapse detection: health checks at steps 500/1K/2K/5K + every val_every
-- `eval.py --checkpoint <ckpt>`: per-timestep accuracy, translation, infilling eval
-- Structured metrics in `<checkpoint_dir>/metrics.jsonl`
+Tried: lower LR, cosine decay, label smoothing, untied weights, smaller vocab (29K).
+None prevented collapse. Smaller vocab and untied weights made it worse.
 
-## Detailed References
-- [training_history.md](training_history.md) — all versions v1-v12b, collapse analysis
-- [gpu_profiling.md](gpu_profiling.md) — GPU memory profiling data (TITAN RTX)
+**Current hypothesis**: Tied embedding feedback loop — CE loss gradient updates embeddings
+used for both input and output, destabilizing input representations over time.
+
+### Possible Next Steps
+1. Freeze token_embedding (only train transformer + output_proj)
+2. Use pretrained BERT embeddings (frozen)
+3. Bottleneck output head (project to small dim before vocab)
+4. Fine-tune a pretrained model instead of training from scratch
+5. Revisit approach B (source-as-corruption)
+
+## Code State (on `discrete` branch)
+- model.py: encoder-only transformer, tied weights, 1/sqrt(d) logit scaling
+- diffusion.py: MaskDiffusion — absorbing state, confidence-based unmasking
+- config.py: currently set to v17 (bert-base-cased, lr=3e-5, label_smoothing=0.1)
+- dataset.py: points to bert-base-cased tokenized data
+- train.py: CE loss on masked positions, cosine LR decay, AdamW
 
 ## Key Gotchas
-- Tokenizer: bert-base-multilingual-cased (~120K vocab)
+- Tokenizer: currently bert-base-cased (29K vocab), was bert-base-multilingual-cased (120K)
 - Python env: .venv/bin/python (.venv in project root)
 - User wants pure diffusion model (no CE auxiliary loss)
 - DDP port conflicts: wait a few seconds between training runs
-- Health check cdist OOMs on GPU for large models — runs token matching on CPU
+- **Logit scaling**: tied embeddings need `/ sqrt(embed_dim)` or logits blow up (std≈22)
+- Health check collapse detection at t=1 (barely masked) is the key diagnostic
+
+## Detailed References
+- [training_history.md](training_history.md) — all versions v1-v17, both phases
+- [discrete_diffusion.md](discrete_diffusion.md) — discrete diffusion design & approaches
+- [gpu_profiling.md](gpu_profiling.md) — GPU memory profiling data (TITAN RTX)

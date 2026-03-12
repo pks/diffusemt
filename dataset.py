@@ -22,8 +22,8 @@ class TranslationDataset(Dataset):
 
 
 DATA_PATHS = {
-    "train": "data/wmt14_en_de_tokenized",
-    "test": "data/wmt14_en_de_tokenized_test",
+    "train": "data/wmt14_en_de_bert_cased",
+    "test": "data/wmt14_en_de_bert_cased_test",
 }
 
 
