@@ -1,7 +1,7 @@
 import argparse
 import torch
 from config import Config
-from model import DiffusionTransformer
+from model import PretrainedDiffusionTransformer
 from diffusion import MaskDiffusion
 from transformers import AutoTokenizer
 
@@ -68,7 +68,6 @@ def infill(text, partial, model, diffusion, tokenizer, config, device):
 
     known_ids_t = torch.tensor([known_ids], device=device)
     infill_mask = torch.tensor([infill_positions], device=device)
-    # target_mask: real tokens (not padding)
     target_mask = torch.tensor([[i < (seq_len - pad_len) for i in range(seq_len)]],
                                device=device, dtype=torch.bool)
 
@@ -85,6 +84,17 @@ def infill(text, partial, model, diffusion, tokenizer, config, device):
     return tokenizer.decode(output_ids[0], skip_special_tokens=True)
 
 
+def build_model(config, device):
+    """Build model from config."""
+    model = PretrainedDiffusionTransformer(
+        pretrained_name=config.pretrained_name,
+        bottleneck_dim=config.bottleneck_dim,
+        freeze_embeddings=False,  # No need to freeze at inference
+        dropout=0.0,
+    ).to(device)
+    return model
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--checkpoint", type=str, required=True)
@@ -97,15 +107,7 @@ def main():
     device = torch.device(config.device if torch.cuda.is_available() else "cpu")
     tokenizer = AutoTokenizer.from_pretrained(config.tokenizer_name)
 
-    model = DiffusionTransformer(
-        vocab_size=tokenizer.vocab_size,
-        embed_dim=config.embed_dim,
-        num_heads=config.num_heads,
-        num_layers=config.num_layers,
-        ff_dim=config.ff_dim,
-        dropout=0.0,
-        max_seq_len=config.max_seq_len * 2,
-    ).to(device)
+    model = build_model(config, device)
 
     checkpoint = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
     model.load_state_dict(checkpoint["model"])

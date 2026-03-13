@@ -81,7 +81,7 @@ class MaskDiffusion(nn.Module):
 
     @torch.no_grad()
     def p_sample_loop(self, model, source_ids, source_mask, target_len,
-                      pad_token_id=0):
+                      pad_token_id=0, cls_token_id=101, sep_token_id=102):
         """Full reverse process: start with all-[MASK] target, iteratively unmask.
 
         Args:
@@ -90,15 +90,30 @@ class MaskDiffusion(nn.Module):
             source_mask: (B, S) bool mask
             target_len: int, length of target sequence (typically max_seq_len)
             pad_token_id: token ID for padding
+            cls_token_id: [CLS] token ID
+            sep_token_id: [SEP] token ID
         """
         B = source_ids.shape[0]
         S = source_ids.shape[1]
         device = source_ids.device
 
-        # Start: target is all [MASK]
-        target_ids = torch.full((B, target_len), self.mask_token_id,
+        # Estimate target length from source (target ≈ source * 1.5, capped)
+        src_lens = source_mask.sum(dim=-1)  # (B,)
+        est_target_lens = (src_lens.float() * 1.5).long().clamp(min=5, max=target_len)
+
+        # Start: [CLS] ... [MASK] ... [SEP] [PAD] ... [PAD]
+        target_ids = torch.full((B, target_len), pad_token_id,
                                 device=device, dtype=torch.long)
-        target_mask = torch.ones(B, target_len, device=device, dtype=torch.bool)
+        target_mask = torch.zeros(B, target_len, device=device, dtype=torch.bool)
+        for b in range(B):
+            tlen = est_target_lens[b].item()
+            target_ids[b, 0] = cls_token_id
+            target_ids[b, 1:tlen-1] = self.mask_token_id
+            target_ids[b, tlen-1] = sep_token_id
+            target_mask[b, :tlen] = True
+
+        # Track which positions are generatable (not CLS, SEP, or PAD)
+        gen_mask = (target_ids == self.mask_token_id)  # initially, only MASK positions
 
         for t in reversed(range(1, self.timesteps + 1)):
             t_tensor = torch.full((B,), t, device=device, dtype=torch.long)
@@ -116,26 +131,27 @@ class MaskDiffusion(nn.Module):
             pred_tokens = probs.argmax(dim=-1)  # (B, T)
             confidence = probs.max(dim=-1).values  # (B, T)
 
-            # How many target tokens should still be masked at t-1?
+            # How many generatable tokens should still be masked at t-1?
             gamma_prev = self.gamma[t - 1]
-            n_mask_prev = (gamma_prev * target_len).long().clamp(min=0)
+            n_gen = gen_mask.sum(dim=-1).float()  # per-batch generatable count
+            n_mask_prev = (gamma_prev * n_gen).long().clamp(min=0)  # (B,)
 
             if t > 1:
-                # Currently masked positions
                 is_masked = (target_ids == self.mask_token_id)
 
-                # Set confidence of already-unmasked positions to inf
+                # Only sort within generatable positions
                 confidence_for_sort = confidence.clone()
+                confidence_for_sort[~gen_mask] = float('inf')
                 confidence_for_sort[~is_masked] = float('inf')
 
-                # Sort by confidence — keep least confident masked
                 sorted_idx = confidence_for_sort.argsort(dim=-1)
 
-                new_target = pred_tokens.clone()
-                # Keep already-unmasked positions as they are
-                new_target[~is_masked] = target_ids[~is_masked]
+                new_target = target_ids.clone()
+                # Unmask: replace MASK with predictions
+                new_target[is_masked] = pred_tokens[is_masked]
+                # Re-mask least confident
                 for b in range(B):
-                    keep_masked = sorted_idx[b, :n_mask_prev]
+                    keep_masked = sorted_idx[b, :n_mask_prev[b]]
                     new_target[b, keep_masked] = self.mask_token_id
                 target_ids = new_target
             else:

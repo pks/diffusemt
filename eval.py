@@ -2,9 +2,9 @@
 import argparse
 import torch
 from config import Config
-from model import DiffusionTransformer
+from model import PretrainedDiffusionTransformer
 from diffusion import MaskDiffusion
-from translate import translate, infill
+from translate import translate, infill, build_model
 from dataset import TranslationDataset
 from torch.utils.data import DataLoader
 from transformers import AutoTokenizer
@@ -158,15 +158,7 @@ def main():
 
     tokenizer = AutoTokenizer.from_pretrained(config.tokenizer_name)
 
-    model = DiffusionTransformer(
-        vocab_size=tokenizer.vocab_size,
-        embed_dim=config.embed_dim,
-        num_heads=config.num_heads,
-        num_layers=config.num_layers,
-        ff_dim=config.ff_dim,
-        dropout=0.0,
-        max_seq_len=config.max_seq_len * 2,
-    ).to(device)
+    model = build_model(config, device)
 
     checkpoint = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
     model.load_state_dict(checkpoint["model"])

@@ -7,7 +7,7 @@ import torch
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from config import Config
-from model import DiffusionTransformer
+from model import PretrainedDiffusionTransformer
 from diffusion import MaskDiffusion
 from dataset import get_dataloader
 from transformers import AutoTokenizer
@@ -58,29 +58,12 @@ def validate(model, diffusion, val_dataloader, config, device):
         loss_mask = is_masked & target_mask
         if loss_mask.sum() > 0:
             loss = torch.nn.functional.cross_entropy(
-                target_logits[loss_mask], target_ids[loss_mask])
+                target_logits[loss_mask].float(), target_ids[loss_mask])
             total_loss += loss.item()
             total_batches += 1
 
     model.train()
     return total_loss / max(total_batches, 1)
-
-
-def enable_gradient_checkpointing(model):
-    """Wrap each encoder layer with activation checkpointing."""
-    from torch.utils.checkpoint import checkpoint
-
-    for i, layer in enumerate(model.encoder.layers):
-        original_forward = layer.forward
-
-        def make_ckpt_forward(orig_fn):
-            def ckpt_forward(src, src_mask=None, src_key_padding_mask=None, is_causal=None):
-                def fn(s, m, kpm):
-                    return orig_fn(s, src_mask=m, src_key_padding_mask=kpm)
-                return checkpoint(fn, src, src_mask, src_key_padding_mask, use_reentrant=False)
-            return ckpt_forward
-
-        layer.forward = make_ckpt_forward(original_forward)
 
 
 @torch.no_grad()
@@ -135,10 +118,11 @@ def health_check(model, diffusion, config, device,
 
     model.train()
 
-    # Collapse detection
-    t_low = 1
-    t_low_unique = results.get(f"t{t_low}_unique", 0)
-    collapsed = 0 < t_low_unique < 5
+    # Collapse detection: use t=T/2 where ~50% tokens are masked for meaningful signal
+    # (t=1 has near-zero masking rate with cosine schedule, so unique count is unreliable)
+    t_mid = config.timesteps // 2
+    t_mid_unique = results.get(f"t{t_mid}_unique", 0)
+    collapsed = 0 < t_mid_unique < 5
 
     return results, collapsed
 
@@ -161,31 +145,29 @@ def train(resume_from=None):
         effective_batch = config.batch_size * world_size * config.grad_accum_steps
         print(f"Effective batch size: {effective_batch}")
 
-    tokenizer = AutoTokenizer.from_pretrained(config.tokenizer_name)
-    vocab_size = tokenizer.vocab_size
-
-    # max_seq_len for model = 2 * per-side max (source + target concatenated)
-    model = DiffusionTransformer(
-        vocab_size=vocab_size,
-        embed_dim=config.embed_dim,
-        num_heads=config.num_heads,
-        num_layers=config.num_layers,
-        ff_dim=config.ff_dim,
+    # Build pretrained model
+    model = PretrainedDiffusionTransformer(
+        pretrained_name=config.pretrained_name,
+        bottleneck_dim=config.bottleneck_dim,
+        freeze_embeddings=config.freeze_embeddings,
         dropout=config.dropout,
-        max_seq_len=config.max_seq_len * 2,
     ).to(device)
 
-    enable_gradient_checkpointing(model)
+    # Enable BERT's built-in gradient checkpointing
+    model.encoder.gradient_checkpointing = True
 
     if distributed:
-        model = DDP(model, device_ids=[local_rank])
+        model = DDP(model, device_ids=[local_rank], find_unused_parameters=False)
 
     raw_model = model.module if distributed else model
 
     if is_main:
-        n_params = sum(p.numel() for p in raw_model.parameters())
-        n_tied = raw_model.output_proj.weight.numel()
-        print(f"Model params: {(n_params - n_tied) / 1e6:.1f}M (+ {n_tied / 1e6:.1f}M tied)")
+        total_params = sum(p.numel() for p in raw_model.parameters())
+        trainable_params = sum(p.numel() for p in raw_model.parameters() if p.requires_grad)
+        frozen_params = total_params - trainable_params
+        print(f"Model params: {total_params / 1e6:.1f}M total, "
+              f"{trainable_params / 1e6:.1f}M trainable, "
+              f"{frozen_params / 1e6:.1f}M frozen")
 
     diffusion = MaskDiffusion(
         timesteps=config.timesteps,
@@ -193,16 +175,15 @@ def train(resume_from=None):
         schedule=config.schedule,
     ).to(device)
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=config.lr, weight_decay=0.01)
+    # Only optimize trainable parameters
+    trainable_params = [p for p in model.parameters() if p.requires_grad]
+    optimizer = torch.optim.AdamW(trainable_params, lr=config.lr, weight_decay=0.01)
 
     warmup_steps = getattr(config, 'warmup_steps', 0)
-    # Total optimizer steps for cosine decay
     total_opt_steps = config.num_train_steps // config.grad_accum_steps
     def lr_lambda(current_step):
-        # Linear warmup
         if current_step < warmup_steps:
             return current_step / max(warmup_steps, 1)
-        # Cosine decay to 0 after warmup
         progress = (current_step - warmup_steps) / max(total_opt_steps - warmup_steps, 1)
         return 0.5 * (1.0 + math.cos(math.pi * progress))
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
@@ -241,10 +222,6 @@ def train(resume_from=None):
             with open(log_path, "a") as f:
                 f.write(json.dumps(metrics) + "\n")
 
-    loss_window = []
-    PLATEAU_WINDOW = 20
-    PLATEAU_THRESHOLD = 0.005
-
     model.train()
     running_loss = 0.0
 
@@ -278,8 +255,8 @@ def train(resume_from=None):
             with torch.amp.autocast("cuda", dtype=torch.float16):
                 logits = model(input_ids, padding_mask, segment_ids, t)
 
-            # Cross-entropy on masked target positions only (fp32 for 120K vocab)
-            target_logits = logits[:, S:].float()  # (B, T, V)
+            # Cross-entropy on masked target positions only (fp32 for large vocab)
+            target_logits = logits[:, S:].float()
             loss_mask = is_masked & target_mask
             if loss_mask.sum() > 0:
                 loss = torch.nn.functional.cross_entropy(
@@ -295,7 +272,7 @@ def train(resume_from=None):
 
             if (step + 1) % config.grad_accum_steps == 0:
                 scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                torch.nn.utils.clip_grad_norm_(trainable_params, 1.0)
                 scaler.step(optimizer)
                 scaler.update()
                 optimizer.zero_grad()
@@ -309,15 +286,6 @@ def train(resume_from=None):
                 print(f"Step {step}/{config.num_train_steps} | Loss: {avg_loss:.4f} | LR: {lr_now:.2e}")
                 log_metrics({"step": step, "train_loss": round(avg_loss, 4), "lr": lr_now})
                 running_loss = 0.0
-
-                loss_window.append(avg_loss)
-                if len(loss_window) > PLATEAU_WINDOW:
-                    loss_window.pop(0)
-                if len(loss_window) == PLATEAU_WINDOW and step > config.warmup_steps * config.grad_accum_steps:
-                    spread = max(loss_window) - min(loss_window)
-                    if spread < PLATEAU_THRESHOLD:
-                        print(f"WARNING: Loss plateau detected (spread={spread:.4f} over {PLATEAU_WINDOW} intervals)")
-                        log_metrics({"step": step, "event": "plateau_warning", "spread": round(spread, 4)})
 
             if is_main and (step in health_check_steps or step % config.val_every == 0):
                 hc_results, collapsed = health_check(

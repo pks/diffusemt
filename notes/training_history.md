@@ -107,15 +107,87 @@ model improves, it pushes embeddings apart to create sharper predictions, which
 destabilizes the input distribution. The 1/sqrt(d) logit scaling helps but doesn't
 fully prevent this.
 
-### Possible Next Steps for Discrete
-1. **Freeze token_embedding** — only train output_proj (untied) and transformer layers
-2. **Use pretrained embeddings** — initialize from BERT and freeze
-3. **Separate input/output embeddings** — untied but with smaller output projection
-   (e.g., project to 256d first, then to vocab)
-4. **Different architecture**: try a standard pretrained model (e.g., mBART) with
-   masking-based fine-tuning instead of training from scratch
-5. **Revisit approach B** (source-as-corruption): the collapse might be specific to
-   the concatenation approach
+### v18: Pretrained BERT — SOLVED COLLAPSE
+
+**Architecture**: Pretrained `bert-base-multilingual-cased` (12L/768d/12H) with:
+- Frozen word embeddings (91.8M params frozen)
+- Unfrozen encoder layers, position/segment/LayerNorm embeddings
+- Untied bottleneck output head: LayerNorm → Linear(768,256) → GELU → Linear(256,119547)
+- Sinusoidal timestep conditioning added to hidden states
+- Gradient checkpointing (BERT's built-in `encoder.gradient_checkpointing = True`)
+- 209.4M total params, 117.6M trainable
+
+**Training config**:
+- DDP on 2x TITAN RTX, batch_size=64/GPU, grad_accum=4 → effective batch 512
+- lr=5e-5, warmup=2000 steps, cosine decay to 100K steps
+- Mixed precision (fp16), AdamW, grad clip 1.0
+- T=200 timesteps, cosine schedule
+
+**Key fix**: Collapse detection changed from t=1 (unreliable with cosine schedule near-zero masking)
+to t=T/2 (50% masking). False positive collapse at step 15000 was caused by
+t=1 having only 1 masked position in the entire batch (larger batch=64 vs 48).
+
+| Step | Train Loss | Val Loss | t=200 acc | t=200 unique |
+|------|-----------|----------|-----------|--------------|
+| 2,500 | 7.51 | 7.53 | 12.45% | 4 |
+| 5,000 | 6.42 | 6.51 | 13.24% | 27 |
+| 10,000 | 5.15 | 5.28 | 16.70% | 147 |
+| 15,000 | 4.49 | 4.63 | 17.32% | 253 |
+| 20,000 | 4.18 | 4.27 | 17.40% | 301 |
+| 25,000 | 4.04 | 3.94 | 17.77% | 340 |
+| 30,000 | 3.90 | 3.87 | 17.44% | 360 |
+| 40,000 | 3.80 | 3.65 | 18.36% | 399 |
+| 50,000 | 3.62 | 3.45 | 24.82% | 475 |
+| 60,000 | 3.49 | 3.42 | 24.78% | 467 |
+| 70,000 | 3.48 | 3.35 | 24.42% | 457 |
+| 80,000 | 3.47 | 3.25 | 25.09% | 465 |
+| 90,000 | 3.46 | 3.25 | 22.59% | 478 |
+| 100,000 | 3.53 | 3.26 | 22.71% | 482 |
+
+**Translation quality at 30K steps** (improved sampling with proper target length estimation):
+- "The weather is nice today." → "Die Wetter sind heute schön und gut." ✓
+- "I have a cat." → "Ich habe eine Schütte." (structure OK, wrong noun)
+- "The European Parliament has approved the proposal." → "Das Europäische Parlament hat den Vorschlag dafür zugestimmt." ✓✓
+- "She went to the store to buy some milk." → "Sie kam in den Geschäften, um einige Milch zu kaufen." ✓
+- "Hello, how are you?" → "Ja,, wie sind Sie in der Lage?" (weak)
+
+**Translation quality at 50K steps**:
+- "The weather is nice today." → "Das Wetter ist heute schön und gut." ✓✓ (fixed article)
+- "I have a cat." → "Ich habe eine graue Katze." ✓✓ (correct noun! added "graue"=gray)
+- "The European Parliament has approved the proposal." → "Das Europäische Parlament hat den Vorschlag auch verabschiedet." ✓✓
+- "She went to the store to buy some milk." → "Sie kam in den Geschäft, um einige Menge Milch zu kaufen." ✓ (minor gender error)
+- "Hello, how are you?" → "Hallo, wie sind Sie in der Zeit?" (partial)
+
+**Sampling improvements**: Changed `p_sample_loop` to:
+1. Estimate target length from source length (×1.5)
+2. Initialize target as `[CLS] [MASK]... [SEP] [PAD]...` instead of all-MASK
+3. Fix CLS/SEP/PAD positions during denoising (only unmask middle positions)
+4. Per-sample mask count based on actual generatable positions
+
+**Why it works**: Frozen pretrained embeddings break the tied-embedding feedback loop that
+caused collapse in v13-v17. The pretrained BERT encoder provides strong initialization,
+and the untied bottleneck head (768→256→vocab) prevents the output from destabilizing inputs.
+
+**Final results (100K steps)**:
+- Val loss: 3.26 (best 3.20 at 97.5K)
+- Per-timestep accuracy: 91% at t=1, 26% at t=200
+- Infilling accuracy: 51.5% on middle 20% of target
+- Model produces legitimate EN→DE translations and infilling
+- No collapse throughout entire training run
+
+**Translation quality at 100K steps**:
+- "The weather is nice today." → "Das Wetter ist heute schön und gut." ✓✓
+- "I have a cat." → "Ich habe eine Katze zu haben." ✓ (correct noun, redundant verb)
+- "The European Parliament has approved the proposal." → "Das Europäische Parlament hat den Vorschlag auch verabschiedet." ✓✓
+- "She went to the store to buy some milk." → "Sie ging in den Geschäftsbereich, um einige Milch zu kaufen." ✓
+- "Hello, how are you?" → "Hallo, wie sind Sie in der Lage?" (partial)
+
+**Infilling at 100K steps** (5 positions per blank):
+- "Sie ging ___ um Milch zu kaufen." → "Sie ging in das Geschäft, um Milch zu kaufen." ✓✓ (perfect!)
+- "Das Wetter ist ___" → "Das Wetter ist heute schön." ✓✓ (perfect!)
+
+**Status**: COMPLETE — first working discrete diffusion translation model.
+Checkpoints: `checkpoints_v18_pretrained/model_final.pt` (and model_step_*.pt)
 
 ## Infrastructure (applies to both phases)
 

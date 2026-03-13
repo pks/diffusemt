@@ -63,15 +63,6 @@ class DiffusionTransformer(nn.Module):
         self.output_proj.weight = self.token_embedding.weight
 
     def forward(self, input_ids, padding_mask, segment_ids, t):
-        """
-        Args:
-            input_ids: (B, S+T) concatenated [source | corrupted_target] token IDs
-            padding_mask: (B, S+T) bool mask (True = valid, False = padding)
-            segment_ids: (B, S+T) 0 for source positions, 1 for target positions
-            t: (B,) timestep indices
-        Returns:
-            logits: (B, S+T, vocab_size) predicted token logits
-        """
         B, L = input_ids.shape
         positions = torch.arange(L, device=input_ids.device).unsqueeze(0)
 
@@ -88,3 +79,81 @@ class DiffusionTransformer(nn.Module):
 
         # Predict token logits (scale for tied embeddings)
         return self.output_proj(self.output_norm(x)) / (self.embed_dim ** 0.5)
+
+
+class PretrainedDiffusionTransformer(nn.Module):
+    """
+    Pretrained BERT-based transformer for discrete diffusion MT.
+
+    Uses pretrained multilingual BERT as backbone. Token embeddings are frozen
+    to prevent the tied-embedding feedback loop that caused collapse in v13-v17.
+    Output head is an untied bottleneck projection.
+    """
+
+    def __init__(self, pretrained_name="bert-base-multilingual-cased",
+                 bottleneck_dim=256, freeze_embeddings=True, dropout=0.1):
+        super().__init__()
+        from transformers import BertModel
+
+        bert = BertModel.from_pretrained(pretrained_name)
+        self.embed_dim = bert.config.hidden_size
+        self.vocab_size = bert.config.vocab_size
+
+        # Use BERT's embeddings (word + position + token_type + LayerNorm + dropout)
+        self.embeddings = bert.embeddings
+        # Use BERT's transformer encoder layers
+        self.encoder = bert.encoder
+
+        # Freeze word embeddings to prevent feedback loop
+        if freeze_embeddings:
+            for p in self.embeddings.word_embeddings.parameters():
+                p.requires_grad = False
+
+        # Timestep conditioning (new, trained from scratch)
+        self.time_embed = SinusoidalTimestepEmbedding(self.embed_dim)
+        self.time_proj = nn.Sequential(
+            nn.Linear(self.embed_dim, self.embed_dim),
+            nn.SiLU(),
+            nn.Linear(self.embed_dim, self.embed_dim),
+        )
+
+        # Bottleneck output head (untied from embeddings)
+        self.output_head = nn.Sequential(
+            nn.LayerNorm(self.embed_dim),
+            nn.Linear(self.embed_dim, bottleneck_dim),
+            nn.GELU(),
+            nn.Linear(bottleneck_dim, self.vocab_size),
+        )
+
+        # Initialize output head to produce roughly uniform logits
+        nn.init.normal_(self.output_head[1].weight, std=0.02)
+        nn.init.zeros_(self.output_head[1].bias)
+        nn.init.normal_(self.output_head[3].weight, std=0.02)
+        nn.init.zeros_(self.output_head[3].bias)
+
+    def forward(self, input_ids, padding_mask, segment_ids, t):
+        """
+        Args:
+            input_ids: (B, S+T) concatenated [source | corrupted_target]
+            padding_mask: (B, S+T) bool mask (True = valid, False = padding)
+            segment_ids: (B, S+T) 0 for source, 1 for target
+            t: (B,) timestep indices
+        Returns:
+            logits: (B, S+T, vocab_size)
+        """
+        # BERT embeddings: word + position + token_type + LayerNorm + dropout
+        x = self.embeddings(input_ids=input_ids, token_type_ids=segment_ids)
+
+        # Add timestep conditioning
+        t_emb = self.time_proj(self.time_embed(t))  # (B, embed_dim)
+        x = x + t_emb.unsqueeze(1)
+
+        # BERT encoder expects extended attention mask: (B, 1, 1, L)
+        # 0.0 for positions to attend, -10000.0 for positions to ignore
+        extended_mask = padding_mask[:, None, None, :].float()
+        extended_mask = (1.0 - extended_mask) * -10000.0
+
+        encoder_output = self.encoder(x, attention_mask=extended_mask)
+        hidden_states = encoder_output.last_hidden_state
+
+        return self.output_head(hidden_states)
