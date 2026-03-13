@@ -120,6 +120,182 @@ class GaussianDiffusion(nn.Module):
         return xt
 
     @torch.no_grad()
+    def ddim_sample(self, model, xt, t_int, t_prev_int, source_ids, source_mask,
+                    embedding_weight=None, x0_self_cond=None):
+        """Single DDIM reverse step: deterministic, no added noise."""
+        B = xt.shape[0]
+        t = torch.full((B,), t_int, device=xt.device, dtype=torch.long)
+
+        predicted_x0 = model(source_ids, source_mask, xt, t,
+                             x0_self_cond=x0_self_cond)
+
+        if embedding_weight is not None:
+            predicted_x0 = self._clamp_to_embeddings(predicted_x0, embedding_weight)
+
+        if t_prev_int < 0:
+            return predicted_x0, predicted_x0
+
+        # DDIM deterministic step
+        alpha_bar_t = self.alpha_bar[t_int]
+        alpha_bar_prev = self.alpha_bar[t_prev_int]
+
+        # Recover predicted noise from x0 prediction
+        pred_eps = (xt - torch.sqrt(alpha_bar_t) * predicted_x0) / torch.sqrt(1 - alpha_bar_t).clamp(min=1e-8)
+
+        # Deterministic step to t_prev
+        x_prev = torch.sqrt(alpha_bar_prev) * predicted_x0 + torch.sqrt(1 - alpha_bar_prev) * pred_eps
+
+        return x_prev, predicted_x0
+
+    @torch.no_grad()
+    def ddim_sample_loop(self, model, source_ids, source_mask, seq_len, embed_dim,
+                         embedding_weight=None, ddim_steps=50):
+        """DDIM reverse process with strided timesteps."""
+        B = source_ids.shape[0]
+        device = source_ids.device
+
+        # Build strided timestep schedule
+        step_size = self.timesteps // ddim_steps
+        timesteps = list(range(self.timesteps - 1, -1, -step_size))
+        if timesteps[-1] != 0:
+            timesteps.append(0)
+
+        xt = torch.randn(B, seq_len, embed_dim, device=device)
+        x0_self_cond = None
+
+        for i, t in enumerate(timesteps):
+            t_prev = timesteps[i + 1] if i + 1 < len(timesteps) else -1
+            xt, x0_pred = self.ddim_sample(
+                model, xt, t, t_prev, source_ids, source_mask,
+                embedding_weight=embedding_weight,
+                x0_self_cond=x0_self_cond,
+            )
+            x0_self_cond = x0_pred.detach()
+
+        return xt
+
+    def _ddim_denoise_from(self, model, xt, t_start, source_ids, source_mask,
+                           embedding_weight=None, ddim_steps=50):
+        """Run DDIM from t_start down to 0. Returns denoised x0."""
+        step_size = max(1, t_start // ddim_steps)
+        timesteps = list(range(t_start, -1, -step_size))
+        if timesteps[-1] != 0:
+            timesteps.append(0)
+
+        x0_self_cond = None
+        for i, t in enumerate(timesteps):
+            t_prev = timesteps[i + 1] if i + 1 < len(timesteps) else -1
+            xt, x0_pred = self.ddim_sample(
+                model, xt, t, t_prev, source_ids, source_mask,
+                embedding_weight=embedding_weight,
+                x0_self_cond=x0_self_cond,
+            )
+            x0_self_cond = x0_pred.detach()
+        return xt
+
+    @torch.no_grad()
+    def ddim_progressive_sample_loop(self, model, source_ids, source_mask, seq_len, embed_dim,
+                                     embedding_weight=None, ddim_steps=50,
+                                     t_init=900, refinement_starts=None):
+        """Truncated progressive DDIM: start from t_init (skip dead zone), then refine.
+
+        Args:
+            t_init: start from this timestep instead of T-1 (skip near-zero alpha_bar zone)
+            refinement_starts: list of timesteps to restart from after first pass.
+        """
+        if refinement_starts is None:
+            refinement_starts = [700, 500, 300]
+
+        B = source_ids.shape[0]
+        device = source_ids.device
+
+        # Pass 1: start from noise at t_init (not t=T-1)
+        xt = torch.randn(B, seq_len, embed_dim, device=device)
+        x0 = self._ddim_denoise_from(model, xt, t_init, source_ids, source_mask,
+                                     embedding_weight=embedding_weight, ddim_steps=ddim_steps)
+
+        # Refinement passes: re-noise and denoise at progressively lower levels
+        for t_start in refinement_starts:
+            if t_start >= t_init:
+                continue
+            t_tensor = torch.full((B,), t_start, device=device, dtype=torch.long)
+            xt, _ = self.q_sample(x0, t_tensor)
+            x0 = self._ddim_denoise_from(model, xt, t_start, source_ids, source_mask,
+                                         embedding_weight=embedding_weight, ddim_steps=ddim_steps)
+
+        return x0
+
+    @torch.no_grad()
+    def iterative_refine(self, model, source_ids, source_mask, seq_len, embed_dim,
+                         embedding_weight, emb_scale, tokenizer,
+                         n_rounds=10, t_noise=500):
+        """Source-copy initialization + iterative refinement.
+
+        Start from noisy source embeddings (model trained with source-init),
+        then denoise and iteratively refine at decreasing noise levels.
+        """
+        B = source_ids.shape[0]
+        device = source_ids.device
+        emb_norm = embedding_weight / emb_scale
+
+        # Initialize from source embeddings + noise
+        x0_src = emb_norm[source_ids]
+        t_tensor = torch.full((B,), t_noise, device=device, dtype=torch.long)
+        xt, _ = self.q_sample(x0_src, t_tensor)
+
+        # Denoise with DDIM
+        x0 = self._ddim_denoise_from(model, xt, t_noise, source_ids, source_mask,
+                                     embedding_weight=emb_norm, ddim_steps=50)
+
+        # Refinement passes at decreasing noise levels
+        for t_refine in [300, 200, 100]:
+            pred_scaled = x0 * emb_scale
+            token_ids = torch.cdist(pred_scaled, embedding_weight.unsqueeze(0).float(), p=2).argmin(dim=-1)
+            x0_snapped = emb_norm[token_ids]
+            t_tensor = torch.full((B,), t_refine, device=device, dtype=torch.long)
+            xt, _ = self.q_sample(x0_snapped, t_tensor)
+            x0 = self._ddim_denoise_from(model, xt, t_refine, source_ids, source_mask,
+                                         embedding_weight=emb_norm, ddim_steps=20)
+
+        return x0
+
+    @torch.no_grad()
+    def ddim_sample_loop_infill(self, model, source_ids, source_mask,
+                                known_x0, infill_mask, seq_len, embed_dim,
+                                embedding_weight=None, ddim_steps=50):
+        """DDIM infilling with strided timesteps."""
+        B = source_ids.shape[0]
+        device = source_ids.device
+
+        step_size = self.timesteps // ddim_steps
+        timesteps = list(range(self.timesteps - 1, -1, -step_size))
+        if timesteps[-1] != 0:
+            timesteps.append(0)
+
+        xt = torch.randn(B, seq_len, embed_dim, device=device)
+        infill = infill_mask.unsqueeze(-1).float()
+        x0_self_cond = None
+
+        for i, t in enumerate(timesteps):
+            t_prev = timesteps[i + 1] if i + 1 < len(timesteps) else -1
+            denoised, x0_pred = self.ddim_sample(
+                model, xt, t, t_prev, source_ids, source_mask,
+                embedding_weight=embedding_weight,
+                x0_self_cond=x0_self_cond,
+            )
+            x0_self_cond = x0_pred.detach()
+
+            if t_prev >= 0:
+                t_prev_tensor = torch.full((B,), t_prev, device=device, dtype=torch.long)
+                known_noisy, _ = self.q_sample(known_x0, t_prev_tensor)
+            else:
+                known_noisy = known_x0
+
+            xt = known_noisy * (1 - infill) + denoised * infill
+
+        return xt
+
+    @torch.no_grad()
     def p_sample_loop_infill(self, model, source_ids, source_mask,
                              known_x0, infill_mask, seq_len, embed_dim,
                              embedding_weight=None):

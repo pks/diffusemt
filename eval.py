@@ -132,11 +132,11 @@ def eval_infilling_accuracy(model, diffusion, config, device, emb_scale, n_sampl
         known_x0 = model.token_embedding(target_ids) / emb_scale
 
     # Run infilling
-    denoised = diffusion.p_sample_loop_infill(
+    denoised = diffusion.ddim_sample_loop_infill(
         model, source_ids, source_mask,
         known_x0, infill_mask,
         seq_len=T, embed_dim=config.embed_dim,
-        embedding_weight=norm_emb_weight,
+        embedding_weight=norm_emb_weight, ddim_steps=50,
     )
 
     denoised_scaled = denoised * emb_scale

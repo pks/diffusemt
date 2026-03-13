@@ -22,17 +22,16 @@ def translate(text, model, diffusion, tokenizer, config, device, emb_scale):
     source_mask = src["attention_mask"].to(device).bool()
 
     model.eval()
-    # Normalized embedding weight for clamping during reverse diffusion
-    norm_emb_weight = model.token_embedding.weight.data / emb_scale
+    embedding_weight = model.token_embedding.weight.data
 
-    denoised = diffusion.p_sample_loop(
+    denoised = diffusion.iterative_refine(
         model, source_ids, source_mask,
         seq_len=config.max_seq_len, embed_dim=config.embed_dim,
-        embedding_weight=norm_emb_weight,
+        embedding_weight=embedding_weight, emb_scale=emb_scale,
+        tokenizer=tokenizer, n_rounds=10, t_noise=500,
     )
 
     denoised = denoised * emb_scale
-    embedding_weight = model.token_embedding.weight.data
     token_ids = embeddings_to_tokens(denoised, embedding_weight)
     return tokenizer.decode(token_ids[0], skip_special_tokens=True)
 
@@ -104,11 +103,11 @@ def infill(text, partial, model, diffusion, tokenizer, config, device, emb_scale
         known_x0 = model.token_embedding(known_ids_t) / emb_scale
 
     # Run infilling
-    denoised = diffusion.p_sample_loop_infill(
+    denoised = diffusion.ddim_sample_loop_infill(
         model, source_ids, source_mask,
         known_x0, infill_mask,
         seq_len=seq_len, embed_dim=config.embed_dim,
-        embedding_weight=norm_emb_weight,
+        embedding_weight=norm_emb_weight, ddim_steps=50,
     )
 
     denoised = denoised * emb_scale
