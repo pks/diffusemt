@@ -189,6 +189,205 @@ and the untied bottleneck head (768→256→vocab) prevents the output from dest
 **Status**: COMPLETE — first working discrete diffusion translation model.
 Checkpoints: `checkpoints_v18_pretrained/model_final.pt` (and model_step_*.pt)
 
+---
+
+## Phase 3: Source-as-Corruption Discrete Diffusion (v19-v20)
+
+**Approach B**: Forward diffusion replaces German target tokens with English source tokens.
+At t=T the sequence IS English, at t=0 it's German. Translation = reverse diffusion from English.
+Where source is shorter than target, [MASK] is fallback noise. Single sequence (no concat).
+
+Motivation: v18's infilling was confounded by BERT's native MLM capability for same-language
+German. Source-as-corruption makes infilling genuinely cross-lingual — the "noise" is English
+tokens, which BERT's MLM can't denoise.
+
+### v19: Source-as-Corruption with Untied Bottleneck Head — COLLAPSED
+
+**Architecture**: Pretrained mBERT encoder + from-scratch untied bottleneck output head
+(LayerNorm → Linear(768,256) → GELU → Linear(256,vocab)). Single sequence, no segment
+embeddings. Timestep conditioning. Loss on corrupted positions only.
+
+**Result**: Collapsed at step 1000. Unique tokens dropped from 499 (step 500) to 3 (step 1000).
+The randomly-initialized output head doesn't get enough gradient signal from the sparse
+corrupted-position loss, and collapses to predicting a few common tokens.
+
+### v19b: x0-Loss + Tied Projection — COLLAPSED
+
+Changed to x0-parameterization (loss on ALL target positions, not just corrupted) and tied
+output projection (h @ embedding_weight.T). Still collapsed at step 1000 (unique=1 at random
+init tied projection, unique=5 at pretrained-LN tied projection). The tied projection delays
+but doesn't prevent collapse when the transform layers are randomly initialized.
+
+### v20: MLM-Head-Initialized Output + x0-Loss — SOLVED
+
+**Key insight**: Initialize the output head transform from BERT's pretrained MLM head
+(dense + LayerNorm + bias), not from scratch. The pretrained init produces diverse outputs
+from the start, preventing the collapse attractor.
+
+**Architecture**:
+- Pretrained mBERT encoder + encoder layers (same as v18)
+- Frozen word embeddings (91.8M frozen)
+- Output head: `output_proj` (pretrained from BERT MLM dense), `output_norm` (pretrained from BERT MLM LayerNorm), tied projection via `h @ word_embedding.T + output_bias`
+- Sinusoidal timestep conditioning
+- x0-parameterization: loss on ALL real target positions
+- 179.2M total params, 87.3M trainable
+- Single sequence (no concat, no segment embeddings)
+
+**Training config**:
+- DDP on 2x TITAN RTX, batch_size=96/GPU, grad_accum=6 → effective batch 1152
+- lr=3e-5, warmup=4000 optimizer steps (24K training steps), cosine decay to 100K
+- Mixed precision (fp16), AdamW, grad clip 1.0
+- T=200 timesteps, cosine schedule
+
+| Step | Train Loss | Val Loss | t=100 acc | t=100 unique | t=200 acc | t=200 unique |
+|------|-----------|----------|-----------|--------------|-----------|--------------|
+| 500 | 22.32 | - | 2.48% | 235 | 1.34% | 416 |
+| 1,000 | 7.01 | - | 7.38% | 371 | 4.75% | 403 |
+| 2,000 | 5.00 | - | 21.03% | 600 | 10.62% | 308 |
+| 2,500 | 4.67 | 3.21 | 26.83% | 583 | 13.09% | 299 |
+| 5,000 | 4.20 | 2.79 | 31.70% | 603 | 14.94% | 258 |
+| 10,000 | 4.08 | 2.59 | 37.83% | 610 | 15.74% | 308 |
+| 20,000 | 3.87 | 2.43 | 42.33% | 646 | 16.57% | 398 |
+| 50,000 | 3.57 | 2.20 | 45.60% | 744 | 18.11% | 502 |
+| 75,000 | 3.51 | 2.10 | 48.47% | 751 | 18.35% | 606 |
+| 100,000 | 3.52 | 2.17 | 51.92% | 639 | 22.39% | 567 |
+
+**High initial loss (35.5)**: The pretrained MLM head confidently predicts wrong tokens for the
+cross-lingual denoising task. This rapidly drops as the model adapts (35 → 7 in first 1000 steps).
+
+**Translation quality at 10K steps**:
+- "Das Europäische Parlament hat die Vorschlagen bewändet." (forming German structure)
+- "Ich habe einen cat - Hund gefunden." (English still leaking)
+
+**Translation quality at 50K steps**:
+- "Das Europäische Parlament hat den Vorschlag zu dieser Frage vorgelegt." (good grammar)
+- "Sie kamen zum Coffee Shop, um einige Verkaufsreise zu kaufen." (knows "zu kaufen")
+
+**Final results (100K steps)**:
+- Val loss: 2.17 (best 2.10 at 75K)
+- Per-timestep accuracy: 100% at t=1, 66% at t=81, 58% at t=101, 25% at t=200
+- Infilling accuracy: 27.18% on middle 20%, 100% on known positions
+
+**Translation quality at 100K steps**:
+- "The European Parliament has approved the proposal." → "Das Europäische Parlament hat den Vorschlag der Kommission gestimmt."
+- "She went to the store to buy some milk." → "Sie kamen zum Coffee Shop, um eine Menge von Milch zu kaufen."
+- "I have a cat." → "Ich habe einen Schlüssel." (wrong noun but correct case/article)
+
+**Infilling at 100K steps**:
+- "Ich habe ___ Katze." → "Ich habe eine Katze, eine Katze." (correct article)
+- "Sie ging ___ um Milch zu kaufen." → "Sie ging in den Großhandel, um Milch zu kaufen." ✓
+- "___ eine Katze." → "Ich habe a.. eine Katze." (reconstructs subject)
+
+**Why v20 works where v19 failed**: The randomly-initialized output head collapses because it
+starts in a low-diversity region of parameter space and the gradients (even with x0-loss) are
+insufficient to escape. The pretrained MLM head provides a high-diversity starting point —
+it already produces diverse token predictions, and the model only needs to adapt those predictions
+from same-language MLM to cross-lingual denoising.
+
+**Comparison with v18**:
+- v18 (mask-based, concat): val_loss 3.26, infill accuracy 51.5%
+- v20 (source-as-corruption): val_loss 2.17, infill accuracy 27.2%
+- v20 has better val loss but lower infill accuracy (task is harder: cross-lingual noise)
+- v20's infilling is genuinely cross-lingual (not confounded by BERT's same-language MLM)
+
+**Status**: COMPLETE. Checkpoints: `checkpoints_v20_sourcecorrupt/model_final.pt`
+
+---
+
+## Phase 4: From-Scratch Encoder-Decoder (v21-v23)
+
+**Goal**: No pretrained model (only frozen mBERT embeddings). From-scratch Pre-LN encoder-decoder with source-as-corruption diffusion.
+
+### v21: Two-Phase Training (AR Warmup → Diffusion) — SOLVED FROM-SCRATCH COLLAPSE
+
+**Architecture**: From-scratch Pre-LN encoder-decoder
+- 6 encoder layers (PreLNEncoderLayer: self-attn + FF)
+- 6 decoder layers (PreLNDecoderLayer: self-attn + cross-attn + FF)
+- model_dim=512, num_heads=8, ff_dim=2048, embed_dim=768 (mBERT)
+- Frozen mBERT word embeddings (input) + frozen output_embedding (registered buffer)
+- embed_proj: Linear(768→512), learned position embeddings, sinusoidal timestep conditioning
+- Output: output_proj(h) @ output_embedding.T + output_bias
+- Auxiliary encoder MLM head (15% masking, weight=0.1)
+- 138.1M total, 46.3M trainable, 91.8M frozen
+
+**Key innovation**: Two-phase training
+- Phase 1 (steps 0-30K): Autoregressive seq2seq with causal masking + teacher forcing
+- Phase 2 (steps 30K-100K): Source-as-corruption diffusion with timestep curriculum (t_max ramps 10→200 from step 30K to 50K)
+
+**Why two-phase works**: From-scratch encoder collapses in diffusion because it produces degenerate representations. AR warmup establishes stable encoder-decoder cross-attention patterns that survive the transition to diffusion.
+
+**Collapse attempts 1-4 failed**: Frozen/trainable output embedding, reconstruction warmup, skip connections — all collapsed at step 2000-2500.
+
+**Training**: batch_size=64, grad_accum=8, lr=1e-4, warmup=8000 opt steps, 2x TITAN RTX DDP
+
+| Step | Val Loss | t=100 acc | t=100 unique | t=200 acc | t=200 unique |
+|------|----------|-----------|--------------|-----------|--------------|
+| 32500 | 5.07 | 7.4% | 484 | 6.1% | 891 |
+| 50000 | 2.82 | 27.9% | 330 | 17.9% | 319 |
+| 70000 | 2.33 | 39.3% | 454 | 19.7% | 391 |
+| 90000 | 2.21 | 43.1% | 486 | 18.3% | 379 |
+
+**BLEU (90K, temp=1.5, ratio=1.2)**: 9.40
+**BLEU (90K, temp=2.0, ratio=1.1)**: ~9.3
+Process crashed with SIGABRT during final save at 100K (OOM on val+health+save), but 90K checkpoint has essentially converged (LR was near zero).
+
+### v22: Extended Training (200K total) — LR Restart
+
+Resumed from v21 90K checkpoint with num_train_steps=200K (fresh cosine schedule). The LR restart from near-zero to ~9e-05 gave continued learning.
+
+| Step | Val Loss | t=100 acc | t=200 acc |
+|------|----------|-----------|-----------|
+| 100K | 2.11 | 45.9% | 18.3% |
+| 122.5K | 1.96 | 47.5% | 18.6% |
+| 137.5K | 1.91 | — | — |
+| 160K | 1.87 | ~53% | ~24% |
+| 180K | 1.83 (best) | ~55% | ~24% |
+| 190K | 1.97 | ~55% | ~25% |
+
+**BLEU results (190K checkpoint)**:
+
+| Temperature | Length Ratio | BLEU |
+|-------------|-------------|------|
+| 1.0 | 1.1 | 11.92 |
+| 1.5 | 1.2 | 12.49 |
+| 2.0 | 1.1 | **13.30** |
+| 2.0 | 1.2 | 11.96 |
+| 3.0 | 1.1 | 12.98 |
+
+**Best BLEU: 13.30** (temp=2.0, ratio=1.1)
+
+**Infilling accuracy**: 40.8% on middle 20% of target (up from 27.2% in v20)
+
+**Per-timestep accuracy (190K)**:
+- t=1: 100%, t=81: 73%, t=101: 63%, t=141: 43%, t=200: 26%
+
+**Translation quality (190K)**:
+- "The European Parliament has approved the proposal." → "Das Europäische Parlament hat den Vorschlag verabschiedet." ✓✓
+- "The weather is nice today." → "Das Wetter ist heute schönlich gewesen." ✓ (grammatically odd)
+- "She went to the store to buy some milk." → "Sie ging nach dem Geschäftswerk, einige Milch zu kaufen." ✓
+
+**Sampling improvements**:
+- Temperature scaling during confidence-based unmasking (higher temp = softer confidence → better re-ranking)
+- Step skipping: 100 steps gives 13.22 vs 200 steps 13.30 (half the compute, 99.4% quality)
+- Length ratio 1.1 beats 1.2 (brevity penalty vs padding noise tradeoff)
+
+Process crashed with SIGABRT during final save at 200K (same OOM as v21).
+
+### v23: Extended Training (300K total) — Second LR Restart
+
+Resumed from v22 190K with num_train_steps=300K. Fresh cosine schedule, LR starts at ~4.5e-05.
+Currently training.
+
+**Status**: IN PROGRESS. Checkpoints: `checkpoints_v23_extended/`
+
+**Comparison with previous phases**:
+| Version | Model | Pretrained | Val Loss | BLEU | Infill Acc |
+|---------|-------|------------|----------|------|------------|
+| v18 | mBERT encoder-only | Full | 3.26 | — | 51.5% |
+| v20 | mBERT encoder-only | Full | 2.17 | 7.59 | 27.2% |
+| v21 | From-scratch enc-dec | Embeddings only | 2.21 | 9.40 | — |
+| v22 | From-scratch enc-dec | Embeddings only | 1.83 | **13.30** | 40.8% |
+
 ## Infrastructure (applies to both phases)
 
 ### Bug Fixes Applied (cumulative, continuous phase)

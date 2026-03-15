@@ -1,13 +1,13 @@
 import argparse
 import torch
 from config import Config
-from model import PretrainedDiffusionTransformer
-from diffusion import MaskDiffusion
+from model import SourceCorruptionEncoderDecoder, SourceCorruptionEncoderOnly
+from diffusion import SourceCorruptionDiffusion
 from transformers import AutoTokenizer
 
 
 def translate(text, model, diffusion, tokenizer, config, device):
-    """Translate a single source sentence."""
+    """Translate a single source sentence by denoising from English."""
     src = tokenizer(
         text, max_length=config.max_seq_len, padding="max_length",
         truncation=True, return_tensors="pt",
@@ -15,11 +15,17 @@ def translate(text, model, diffusion, tokenizer, config, device):
     source_ids = src["input_ids"].to(device)
     source_mask = src["attention_mask"].to(device).bool()
 
+    # Estimate target length from source
+    src_len = source_mask.sum().item()
+    est_tgt_len = min(int(src_len * 1.5), config.max_seq_len)
+
+    # Build target_mask: assume target fills est_tgt_len positions
+    target_mask = torch.zeros(1, config.max_seq_len, device=device, dtype=torch.bool)
+    target_mask[0, :est_tgt_len] = True
+
     model.eval()
     output_ids = diffusion.p_sample_loop(
-        model, source_ids, source_mask,
-        target_len=config.max_seq_len,
-    )
+        model, source_ids, source_mask, target_mask)
 
     return tokenizer.decode(output_ids[0], skip_special_tokens=True)
 
@@ -86,12 +92,31 @@ def infill(text, partial, model, diffusion, tokenizer, config, device):
 
 def build_model(config, device):
     """Build model from config."""
-    model = PretrainedDiffusionTransformer(
-        pretrained_name=config.pretrained_name,
-        bottleneck_dim=config.bottleneck_dim,
-        freeze_embeddings=False,  # No need to freeze at inference
-        dropout=0.0,
-    ).to(device)
+    if getattr(config, 'architecture', 'encoder-decoder') == 'encoder-only':
+        model = SourceCorruptionEncoderOnly(
+            pretrained_name=config.pretrained_name,
+            model_dim=config.model_dim,
+            embed_dim=config.embed_dim,
+            num_heads=config.num_heads,
+            num_layers=config.num_layers,
+            ff_dim=config.ff_dim,
+            dropout=0.0,
+            max_seq_len=config.max_seq_len,
+            freeze_embeddings=True,
+        ).to(device)
+    else:
+        model = SourceCorruptionEncoderDecoder(
+            pretrained_name=config.pretrained_name,
+            model_dim=config.model_dim,
+            embed_dim=config.embed_dim,
+            num_heads=config.num_heads,
+            encoder_layers=config.encoder_layers,
+            decoder_layers=config.decoder_layers,
+            ff_dim=config.ff_dim,
+            dropout=0.0,
+            max_seq_len=config.max_seq_len,
+            freeze_embeddings=True,
+        ).to(device)
     return model
 
 
@@ -115,7 +140,7 @@ def main():
     del checkpoint
     print(f"Loaded checkpoint from step {step}")
 
-    diffusion = MaskDiffusion(
+    diffusion = SourceCorruptionDiffusion(
         timesteps=config.timesteps,
         mask_token_id=config.mask_token_id,
         schedule=config.schedule,

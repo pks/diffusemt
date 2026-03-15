@@ -7,10 +7,9 @@ import torch
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from config import Config
-from model import PretrainedDiffusionTransformer
-from diffusion import MaskDiffusion
+from model import SourceCorruptionEncoderDecoder, SourceCorruptionEncoderOnly
+from diffusion import SourceCorruptionDiffusion
 from dataset import get_dataloader
-from transformers import AutoTokenizer
 
 
 def setup_ddp():
@@ -26,9 +25,27 @@ def cleanup_ddp():
     dist.destroy_process_group()
 
 
+def get_t_max(step, config):
+    """Timestep curriculum for diffusion phase.
+
+    Phase 1 (0..ar_steps): autoregressive — returns -1 (signal for AR mode)
+    Phase 2a (ar_steps..curriculum_end_step): t_max ramps from t_start to T
+    Phase 2b (curriculum_end_step+): t_max=T
+    """
+    T = config.timesteps
+    if step < config.ar_steps:
+        return -1  # autoregressive mode
+    elif step < config.curriculum_end_step:
+        progress = (step - config.ar_steps) / (
+            config.curriculum_end_step - config.ar_steps)
+        return max(int(config.curriculum_t_start + (T - config.curriculum_t_start) * progress), 1)
+    else:
+        return T
+
+
 @torch.no_grad()
 def validate(model, diffusion, val_dataloader, config, device):
-    """Run validation and return average cross-entropy loss on masked target positions."""
+    """Run validation and return average cross-entropy loss."""
     model.eval()
     total_loss = 0.0
     total_batches = 0
@@ -40,25 +57,19 @@ def validate(model, diffusion, val_dataloader, config, device):
         target_mask = batch["target_mask"].to(device)
 
         B = target_ids.shape[0]
-        S = source_ids.shape[1]
         t = torch.randint(1, config.timesteps + 1, (B,), device=device)
 
-        # Corrupt target
-        corrupted_target, is_masked = diffusion.q_sample(target_ids, t)
-
-        # Build concatenated input
-        input_ids, padding_mask, segment_ids, _ = diffusion._build_input(
-            source_ids, source_mask, corrupted_target, target_mask)
+        corrupted, is_corrupted = diffusion.q_sample(
+            source_ids, source_mask, target_ids, target_mask, t)
 
         with torch.amp.autocast("cuda", dtype=torch.float16):
-            logits = model(input_ids, padding_mask, segment_ids, t)
+            logits = model(corrupted, target_mask, t,
+                           source_ids=source_ids, source_mask=source_mask)
 
-        # Loss on masked target positions only
-        target_logits = logits[:, S:]
-        loss_mask = is_masked & target_mask
-        if loss_mask.sum() > 0:
+        real_mask = target_mask.bool()
+        if real_mask.sum() > 0:
             loss = torch.nn.functional.cross_entropy(
-                target_logits[loss_mask].float(), target_ids[loss_mask])
+                logits[real_mask].float(), target_ids[real_mask])
             total_loss += loss.item()
             total_batches += 1
 
@@ -86,29 +97,25 @@ def health_check(model, diffusion, config, device,
     target_mask = batch["target_mask"].to(device)
 
     B = target_ids.shape[0]
-    S = source_ids.shape[1]
     real_mask = target_mask.bool()
 
     results = {}
     for t_val in [1, config.timesteps // 4, config.timesteps // 2,
                   3 * config.timesteps // 4, config.timesteps]:
         t = torch.full((B,), t_val, device=device, dtype=torch.long)
-        corrupted_target, is_masked = diffusion.q_sample(target_ids, t)
-
-        input_ids, padding_mask, segment_ids, _ = diffusion._build_input(
-            source_ids, source_mask, corrupted_target, target_mask)
+        corrupted, is_corrupted = diffusion.q_sample(
+            source_ids, source_mask, target_ids, target_mask, t)
 
         with torch.amp.autocast("cuda", dtype=torch.float16):
-            logits = model(input_ids, padding_mask, segment_ids, t)
+            logits = model(corrupted, target_mask, t,
+                           source_ids=source_ids, source_mask=source_mask)
 
-        target_logits = logits[:, S:]
-        pred_tokens = target_logits.argmax(dim=-1)
+        pred_tokens = logits.argmax(dim=-1)
 
-        # Accuracy on masked real target positions
-        masked_real = is_masked & real_mask
-        if masked_real.sum() > 0:
-            acc = (pred_tokens[masked_real] == target_ids[masked_real]).float().mean().item()
-            n_unique = pred_tokens[masked_real].unique().numel()
+        corrupted_real = is_corrupted & real_mask
+        if corrupted_real.sum() > 0:
+            acc = (pred_tokens[corrupted_real] == target_ids[corrupted_real]).float().mean().item()
+            n_unique = pred_tokens[corrupted_real].unique().numel()
         else:
             acc = 1.0
             n_unique = -1
@@ -118,8 +125,6 @@ def health_check(model, diffusion, config, device,
 
     model.train()
 
-    # Collapse detection: use t=T/2 where ~50% tokens are masked for meaningful signal
-    # (t=1 has near-zero masking rate with cosine schedule, so unique count is unreliable)
     t_mid = config.timesteps // 2
     t_mid_unique = results.get(f"t{t_mid}_unique", 0)
     collapsed = 0 < t_mid_unique < 5
@@ -145,16 +150,32 @@ def train(resume_from=None):
         effective_batch = config.batch_size * world_size * config.grad_accum_steps
         print(f"Effective batch size: {effective_batch}")
 
-    # Build pretrained model
-    model = PretrainedDiffusionTransformer(
-        pretrained_name=config.pretrained_name,
-        bottleneck_dim=config.bottleneck_dim,
-        freeze_embeddings=config.freeze_embeddings,
-        dropout=config.dropout,
-    ).to(device)
-
-    # Enable BERT's built-in gradient checkpointing
-    model.encoder.gradient_checkpointing = True
+    # Build model with frozen mBERT embeddings
+    if config.architecture == "encoder-only":
+        model = SourceCorruptionEncoderOnly(
+            pretrained_name=config.pretrained_name,
+            model_dim=config.model_dim,
+            embed_dim=config.embed_dim,
+            num_heads=config.num_heads,
+            num_layers=config.num_layers,
+            ff_dim=config.ff_dim,
+            dropout=config.dropout,
+            max_seq_len=config.max_seq_len,
+            freeze_embeddings=config.freeze_embeddings,
+        ).to(device)
+    else:
+        model = SourceCorruptionEncoderDecoder(
+            pretrained_name=config.pretrained_name,
+            model_dim=config.model_dim,
+            embed_dim=config.embed_dim,
+            num_heads=config.num_heads,
+            encoder_layers=config.encoder_layers,
+            decoder_layers=config.decoder_layers,
+            ff_dim=config.ff_dim,
+            dropout=config.dropout,
+            max_seq_len=config.max_seq_len,
+            freeze_embeddings=config.freeze_embeddings,
+        ).to(device)
 
     if distributed:
         model = DDP(model, device_ids=[local_rank], find_unused_parameters=False)
@@ -169,7 +190,7 @@ def train(resume_from=None):
               f"{trainable_params / 1e6:.1f}M trainable, "
               f"{frozen_params / 1e6:.1f}M frozen")
 
-    diffusion = MaskDiffusion(
+    diffusion = SourceCorruptionDiffusion(
         timesteps=config.timesteps,
         mask_token_id=config.mask_token_id,
         schedule=config.schedule,
@@ -179,7 +200,7 @@ def train(resume_from=None):
     trainable_params = [p for p in model.parameters() if p.requires_grad]
     optimizer = torch.optim.AdamW(trainable_params, lr=config.lr, weight_decay=0.01)
 
-    warmup_steps = getattr(config, 'warmup_steps', 0)
+    warmup_steps = config.warmup_steps
     total_opt_steps = config.num_train_steps // config.grad_accum_steps
     def lr_lambda(current_step):
         if current_step < warmup_steps:
@@ -224,6 +245,7 @@ def train(resume_from=None):
 
     model.train()
     running_loss = 0.0
+    running_aux_loss = 0.0
 
     while step < config.num_train_steps:
         if sampler is not None:
@@ -240,39 +262,88 @@ def train(resume_from=None):
             target_mask = batch["target_mask"].to(device)
 
             B = target_ids.shape[0]
-            S = source_ids.shape[1]
 
-            # Sample timesteps (1..T)
-            t = torch.randint(1, config.timesteps + 1, (B,), device=device)
+            # Two-phase training
+            t_max = get_t_max(step, config)
 
-            # Forward diffusion: mask target tokens
-            corrupted_target, is_masked = diffusion.q_sample(target_ids, t)
+            if t_max == -1:
+                # Phase 1: Autoregressive seq2seq with teacher forcing
+                # Input: shifted target (prepend [CLS], drop last token)
+                shifted = torch.zeros_like(target_ids)
+                shifted[:, 0] = 101  # [CLS] token
+                shifted[:, 1:] = target_ids[:, :-1]
 
-            # Build [source | corrupted_target] input
-            input_ids, padding_mask, segment_ids, _ = diffusion._build_input(
-                source_ids, source_mask, corrupted_target, target_mask)
+                t = torch.ones(B, device=device, dtype=torch.long)  # dummy timestep
 
-            with torch.amp.autocast("cuda", dtype=torch.float16):
-                logits = model(input_ids, padding_mask, segment_ids, t)
+                with torch.amp.autocast("cuda", dtype=torch.float16):
+                    logits = model(shifted, target_mask, t,
+                                   source_ids=source_ids, source_mask=source_mask,
+                                   causal=True)
 
-            # Cross-entropy on masked target positions only (fp32 for large vocab)
-            target_logits = logits[:, S:].float()
-            loss_mask = is_masked & target_mask
-            if loss_mask.sum() > 0:
-                loss = torch.nn.functional.cross_entropy(
-                    target_logits[loss_mask], target_ids[loss_mask],
-                    label_smoothing=config.label_smoothing)
+                # Standard teacher-forcing CE loss
+                loss_mask = target_mask.bool()
+                if loss_mask.sum() > 0:
+                    loss = torch.nn.functional.cross_entropy(
+                        logits[loss_mask].float(), target_ids[loss_mask],
+                        label_smoothing=config.label_smoothing)
+                else:
+                    loss = torch.tensor(0.0, device=device)
+                is_corrupted = torch.zeros_like(target_mask)
             else:
-                loss = torch.tensor(0.0, device=device)
+                # Phase 2: Source-as-corruption diffusion
+                t = torch.randint(1, t_max + 1, (B,), device=device)
+                corrupted, is_corrupted = diffusion.q_sample(
+                    source_ids, source_mask, target_ids, target_mask, t)
 
-            loss = loss / config.grad_accum_steps
-            scaler.scale(loss).backward()
+                with torch.amp.autocast("cuda", dtype=torch.float16):
+                    logits = model(corrupted, target_mask, t,
+                                   source_ids=source_ids, source_mask=source_mask,
+                                   causal=False)
 
-            running_loss += loss.item() * config.grad_accum_steps
+                # x0-parameterization: CE on all real target positions
+                loss_mask = target_mask.bool()
+                if loss_mask.sum() > 0:
+                    loss = torch.nn.functional.cross_entropy(
+                        logits[loss_mask].float(), target_ids[loss_mask],
+                        label_smoothing=config.label_smoothing)
+                else:
+                    loss = torch.tensor(0.0, device=device)
+
+            # Auxiliary encoder MLM loss (only for encoder-decoder models)
+            aux_loss = torch.tensor(0.0, device=device)
+            m = model.module if distributed else model
+            if config.aux_mlm_weight > 0 and hasattr(m, 'encode_source'):
+                enc_out = m.encode_source(source_ids, source_mask)
+                if enc_out is not None:
+                    with torch.amp.autocast("cuda", dtype=torch.float16):
+                        aux_logits = m.aux_mlm_logits(enc_out)
+                    # Mask 15% of source positions
+                    src_real = source_mask.bool()
+                    mlm_mask = torch.rand_like(source_mask.float()) < 0.15
+                    mlm_mask = mlm_mask & src_real
+                    if mlm_mask.sum() > 0:
+                        aux_loss = torch.nn.functional.cross_entropy(
+                            aux_logits[mlm_mask].float(), source_ids[mlm_mask])
+
+            # Diversity regularization: encourage entropy in predictions (with gradients)
+            div_loss = torch.tensor(0.0, device=device)
+            if config.diversity_weight > 0 and loss_mask.sum() > 0:
+                log_probs = torch.log_softmax(logits[loss_mask].float(), dim=-1)
+                probs = log_probs.exp()
+                entropy = -(probs * log_probs).sum(dim=-1).mean()
+                # Negative because we want to MAXIMIZE entropy (minimize negative entropy)
+                div_loss = -entropy
+
+            total_loss = loss + config.aux_mlm_weight * aux_loss + config.diversity_weight * div_loss
+            total_loss = total_loss / config.grad_accum_steps
+            scaler.scale(total_loss).backward()
+
+            running_loss += loss.item()
+            running_aux_loss += aux_loss.item()
 
             if (step + 1) % config.grad_accum_steps == 0:
                 scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(trainable_params, 1.0)
+                torch.nn.utils.clip_grad_norm_(trainable_params, config.grad_clip)
                 scaler.step(optimizer)
                 scaler.update()
                 optimizer.zero_grad()
@@ -282,26 +353,34 @@ def train(resume_from=None):
 
             if is_main and step % config.log_every == 0:
                 avg_loss = running_loss / config.log_every
+                avg_aux = running_aux_loss / config.log_every
                 lr_now = scheduler.get_last_lr()[0]
-                print(f"Step {step}/{config.num_train_steps} | Loss: {avg_loss:.4f} | LR: {lr_now:.2e}")
-                log_metrics({"step": step, "train_loss": round(avg_loss, 4), "lr": lr_now})
+                t_max_now = get_t_max(step, config)
+                mode = "AR" if t_max_now == -1 else f"t_max={t_max_now}"
+                print(f"Step {step}/{config.num_train_steps} | Loss: {avg_loss:.4f} | "
+                      f"Aux: {avg_aux:.4f} | LR: {lr_now:.2e} | {mode}")
+                log_metrics({"step": step, "train_loss": round(avg_loss, 4),
+                             "aux_loss": round(avg_aux, 4), "lr": lr_now,
+                             "t_max": t_max_now})
                 running_loss = 0.0
+                running_aux_loss = 0.0
 
-            if is_main and (step in health_check_steps or step % config.val_every == 0):
+            if is_main and (step in health_check_steps or step % config.val_every == 0) and get_t_max(step, config) != -1:
                 hc_results, collapsed = health_check(
                     model, diffusion, config, device,
                     iter(dataloader), dataloader, sampler, epoch)
-                t_low = 1
+                t_mid = config.timesteps // 2
                 t_high = config.timesteps
-                print(f"Step {step} | Health: t={t_low} acc={hc_results.get(f't{t_low}_acc', 0):.2%} "
-                      f"unique={hc_results.get(f't{t_low}_unique', 0)}, "
+                print(f"Step {step} | Health: "
+                      f"t={t_mid} acc={hc_results.get(f't{t_mid}_acc', 0):.2%} "
+                      f"unique={hc_results.get(f't{t_mid}_unique', 0)}, "
                       f"t={t_high} acc={hc_results.get(f't{t_high}_acc', 0):.2%} "
                       f"unique={hc_results.get(f't{t_high}_unique', 0)}")
                 log_metrics({"step": step, "event": "health_check", **hc_results})
 
                 if collapsed:
                     print(f"FATAL: Mode collapse detected at step {step}! "
-                          f"t={t_low} unique tokens = {hc_results.get(f't{t_low}_unique', 0)}. Aborting.")
+                          f"t={t_mid} unique tokens = {hc_results.get(f't{t_mid}_unique', 0)}. Aborting.")
                     log_metrics({"step": step, "event": "collapse_abort"})
                     if distributed:
                         cleanup_ddp()

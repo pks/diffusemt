@@ -1,9 +1,9 @@
-"""Evaluate a discrete diffusion checkpoint: per-timestep accuracy, translation, and infilling."""
+"""Evaluate a source-corruption diffusion checkpoint."""
 import argparse
 import torch
 from config import Config
-from model import PretrainedDiffusionTransformer
-from diffusion import MaskDiffusion
+from model import SourceCorruptionEncoderDecoder
+from diffusion import SourceCorruptionDiffusion
 from translate import translate, infill, build_model
 from dataset import TranslationDataset
 from torch.utils.data import DataLoader
@@ -11,7 +11,7 @@ from transformers import AutoTokenizer
 
 
 def per_timestep_accuracy(model, diffusion, config, device, n_samples=16):
-    """Measure single-step prediction accuracy at various masking levels."""
+    """Measure single-step prediction accuracy at various corruption levels."""
     ds = TranslationDataset("data/wmt14_en_de_tokenized")
     loader = DataLoader(ds, batch_size=n_samples, shuffle=False)
     batch = next(iter(loader))
@@ -20,8 +20,6 @@ def per_timestep_accuracy(model, diffusion, config, device, n_samples=16):
     source_mask = batch["source_mask"].to(device)
     target_ids = batch["target_ids"].to(device)
     target_mask = batch["target_mask"].to(device)
-
-    S = source_ids.shape[1]
 
     T = config.timesteps
     if T <= 10:
@@ -34,35 +32,33 @@ def per_timestep_accuracy(model, diffusion, config, device, n_samples=16):
 
     real_mask = target_mask.bool()
 
-    print(f"\n{'t':>5} | {'gamma':>8} | {'masked%':>8} | {'MaskAcc':>8} | {'AllAcc':>8}")
+    print(f"\n{'t':>5} | {'gamma':>8} | {'corr%':>8} | {'CorrAcc':>8} | {'AllAcc':>8}")
     print("-" * 55)
 
     for t_val in test_timesteps:
         B = target_ids.shape[0]
         t = torch.full((B,), t_val, device=device, dtype=torch.long)
-        corrupted_target, is_masked = diffusion.q_sample(target_ids, t)
-
-        input_ids, padding_mask, segment_ids, _ = diffusion._build_input(
-            source_ids, source_mask, corrupted_target, target_mask)
+        corrupted, is_corrupted = diffusion.q_sample(
+            source_ids, source_mask, target_ids, target_mask, t)
 
         with torch.no_grad():
-            logits = model(input_ids, padding_mask, segment_ids, t)
+            logits = model(corrupted, target_mask, t,
+                           source_ids=source_ids, source_mask=source_mask)
 
-        target_logits = logits[:, S:]
-        pred_tokens = target_logits.argmax(dim=-1)
+        pred_tokens = logits.argmax(dim=-1)
 
-        masked_real = is_masked & real_mask
-        if masked_real.sum() > 0:
-            mask_acc = (pred_tokens[masked_real] == target_ids[masked_real]).float().mean().item()
+        corrupted_real = is_corrupted & real_mask
+        if corrupted_real.sum() > 0:
+            corr_acc = (pred_tokens[corrupted_real] == target_ids[corrupted_real]).float().mean().item()
         else:
-            mask_acc = 1.0
+            corr_acc = 1.0
 
         all_acc = (pred_tokens[real_mask] == target_ids[real_mask]).float().mean().item()
 
         gamma = diffusion.gamma[t_val].item()
-        pct_masked = is_masked[real_mask].float().mean().item() if real_mask.sum() > 0 else 0
+        pct_corrupted = is_corrupted[real_mask].float().mean().item() if real_mask.sum() > 0 else 0
 
-        print(f"{t_val:5d} | {gamma:8.4f} | {pct_masked:7.1%} | {mask_acc:7.2%} | {all_acc:7.2%}")
+        print(f"{t_val:5d} | {gamma:8.4f} | {pct_corrupted:7.1%} | {corr_acc:7.2%} | {all_acc:7.2%}")
 
 
 def eval_translations(model, diffusion, tokenizer, config, device):
@@ -166,7 +162,7 @@ def main():
     del checkpoint
     print(f"Loaded checkpoint from step {step}")
 
-    diffusion = MaskDiffusion(
+    diffusion = SourceCorruptionDiffusion(
         timesteps=config.timesteps,
         mask_token_id=config.mask_token_id,
         schedule=config.schedule,
