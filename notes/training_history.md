@@ -405,6 +405,50 @@ Currently training.
 - `eval.py --checkpoint <ckpt>`: per-timestep accuracy, translation, infilling eval
 - Structured metrics in `<checkpoint_dir>/metrics.jsonl`
 
+## Phase 5: Encoder-Only Deep Diffusion (v24+)
+
+### v24 — Deep encoder-only, diffusion-only (no AR warmup)
+- **Architecture**: `SourceCorruptionEncoderOnly` — 12-layer Pre-LN self-attention
+  - Concatenates [source | corrupted_target] (256 tokens total)
+  - Segment embeddings (0=source, 1=target), position embeddings for 2×max_seq_len
+  - Timestep conditioning added to all positions
+  - 131.9M params total, 40.1M trainable, 91.8M frozen (mBERT embeddings)
+- **Training**: Pure diffusion from step 0 (no AR warmup phase)
+  - Curriculum: t_max ramps 1→200 over first 50K steps (gentle start to avoid collapse)
+  - LR warmup: 2K steps (fast ramp to help model learn at low timesteps)
+  - batch_size=64, grad_accum=8, effective_batch=1024 (2× TITAN RTX 24GB)
+  - GPU utilization: 22.2GB/24.6GB per GPU (90%)
+  - 200K total steps, cosine LR with 2K warmup
+- **Status**: Training complete (200K steps)
+- **Motivation**: User asked to make encoder more powerful — single deep encoder
+  sees full [source|target] context instead of split enc/dec.
+- **Results**:
+  - val_loss trajectory: 8.02 → 4.73 → 2.14 → 1.95 → 1.88 → 1.78 → **1.77** (197.5K best)
+  - BLEU 80K (50 steps, temp=2.0): 11.06
+  - BLEU 100K (50 steps, temp=2.0): 11.58
+  - BLEU 190K (50 steps, temp=2.0): **12.73** (best)
+  - BLEU 190K (200 steps, temp=2.0): 12.51
+  - BLEU 190K (200 steps, temp=1.5): 12.31
+  - BLEU 190K (50 steps, temp=1.0): 12.32
+  - For comparison: v22 enc-dec 190K BLEU=13.30 (200 steps), val_loss=1.83
+  - t=100 acc=63%, t=200 acc=22% at 195K (healthy)
+  - **Does NOT beat v22 enc-dec** (12.73 vs 13.30)
+  - More diffusion steps (200 vs 50) did not help — possibly because the source-as-noise
+    scheme doesn't benefit from fine-grained iterative refinement the same way mask diffusion would
+  - Infilling works but with grammatical errors and English leakage
+  - Sample translations show reasonable German output with occasional English words
+- **Key findings**:
+  - Diffusion-only (no AR warmup) works if curriculum starts at t_max=1 and ramps slowly
+  - Initial attempts with t_max=10 start caused collapse at step 2K
+  - Fast LR warmup (2K steps) helps model learn at low timesteps
+  - Health check must test within current curriculum range to avoid false collapse alarms
+  - DDP requires `find_unused_parameters=True` (aux_mlm_head unused when weight=0)
+  - Always maximize GPU memory — test batch sizes to find max that fits
+  - Encoder-only with source-as-noise doesn't clearly beat enc-dec (v22) — suggests the
+    architecture bottleneck isn't the main issue; the corruption strategy may need rethinking
+  - 50 sampling steps slightly outperformed 200 steps — unusual, may indicate the reverse
+    process is miscalibrated for this corruption schedule
+
 ## Data
 - **WMT14 EN→DE**, 4.5M training pairs
 - Tokenized versions:

@@ -24,10 +24,10 @@ class Config:
     mask_token_id: int = 103  # [MASK] for bert-base-multilingual-cased (fallback noise)
 
     # Training
-    batch_size: int = 48
-    grad_accum_steps: int = 10
+    batch_size: int = 64
+    grad_accum_steps: int = 8
     lr: float = 1e-4
-    warmup_steps: int = 8000
+    warmup_steps: int = 2000
     label_smoothing: float = 0.1
     num_train_steps: int = 200000
     log_every: int = 50
@@ -38,8 +38,8 @@ class Config:
 
     # Diffusion-only training (no AR warmup phase)
     ar_steps: int = 0                   # no autoregressive warmup
-    curriculum_end_step: int = 20000    # t_max reaches T at this step
-    curriculum_t_start: int = 10        # start curriculum at t_max=10
+    curriculum_end_step: int = 50000    # t_max reaches T at this step
+    curriculum_t_start: int = 1         # start curriculum at t_max=1
 
     # Auxiliary losses
     aux_mlm_weight: float = 0.0

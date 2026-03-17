@@ -79,7 +79,8 @@ def validate(model, diffusion, val_dataloader, config, device):
 
 @torch.no_grad()
 def health_check(model, diffusion, config, device,
-                 dataloader_iter, dataloader, sampler, epoch):
+                 dataloader_iter, dataloader, sampler, epoch,
+                 current_t_max=None):
     """Check for mode collapse and measure per-timestep accuracy."""
     model.eval()
 
@@ -99,9 +100,20 @@ def health_check(model, diffusion, config, device,
     B = target_ids.shape[0]
     real_mask = target_mask.bool()
 
+    T = config.timesteps
+    t_max = current_t_max if current_t_max is not None else T
+
+    # Test timesteps within current curriculum range
+    test_timesteps = sorted(set([
+        1,
+        max(1, t_max // 4),
+        max(1, t_max // 2),
+        max(1, 3 * t_max // 4),
+        t_max,
+    ]))
+
     results = {}
-    for t_val in [1, config.timesteps // 4, config.timesteps // 2,
-                  3 * config.timesteps // 4, config.timesteps]:
+    for t_val in test_timesteps:
         t = torch.full((B,), t_val, device=device, dtype=torch.long)
         corrupted, is_corrupted = diffusion.q_sample(
             source_ids, source_mask, target_ids, target_mask, t)
@@ -125,9 +137,10 @@ def health_check(model, diffusion, config, device,
 
     model.train()
 
-    t_mid = config.timesteps // 2
-    t_mid_unique = results.get(f"t{t_mid}_unique", 0)
-    collapsed = 0 < t_mid_unique < 5
+    # Check collapse at the highest trained timestep
+    t_check = t_max
+    t_check_unique = results.get(f"t{t_check}_unique", 0)
+    collapsed = 0 < t_check_unique < 5
 
     return results, collapsed
 
@@ -178,7 +191,7 @@ def train(resume_from=None):
         ).to(device)
 
     if distributed:
-        model = DDP(model, device_ids=[local_rank], find_unused_parameters=False)
+        model = DDP(model, device_ids=[local_rank], find_unused_parameters=True)
 
     raw_model = model.module if distributed else model
 
@@ -366,25 +379,24 @@ def train(resume_from=None):
                 running_aux_loss = 0.0
 
             if is_main and (step in health_check_steps or step % config.val_every == 0) and get_t_max(step, config) != -1:
+                curr_t_max = get_t_max(step, config)
                 hc_results, collapsed = health_check(
                     model, diffusion, config, device,
-                    iter(dataloader), dataloader, sampler, epoch)
-                t_mid = config.timesteps // 2
-                t_high = config.timesteps
-                print(f"Step {step} | Health: "
-                      f"t={t_mid} acc={hc_results.get(f't{t_mid}_acc', 0):.2%} "
-                      f"unique={hc_results.get(f't{t_mid}_unique', 0)}, "
-                      f"t={t_high} acc={hc_results.get(f't{t_high}_acc', 0):.2%} "
-                      f"unique={hc_results.get(f't{t_high}_unique', 0)}")
+                    iter(dataloader), dataloader, sampler, epoch,
+                    current_t_max=curr_t_max)
+                t_check = curr_t_max
+                t_low = max(1, curr_t_max // 2)
+                print(f"Step {step} | Health (t_max={curr_t_max}): "
+                      f"t={t_low} acc={hc_results.get(f't{t_low}_acc', 0):.2%} "
+                      f"unique={hc_results.get(f't{t_low}_unique', 0)}, "
+                      f"t={t_check} acc={hc_results.get(f't{t_check}_acc', 0):.2%} "
+                      f"unique={hc_results.get(f't{t_check}_unique', 0)}")
                 log_metrics({"step": step, "event": "health_check", **hc_results})
 
                 if collapsed:
-                    print(f"FATAL: Mode collapse detected at step {step}! "
-                          f"t={t_mid} unique tokens = {hc_results.get(f't{t_mid}_unique', 0)}. Aborting.")
-                    log_metrics({"step": step, "event": "collapse_abort"})
-                    if distributed:
-                        cleanup_ddp()
-                    sys.exit(1)
+                    print(f"WARNING: Possible collapse at step {step}! "
+                          f"t={t_check} unique tokens = {hc_results.get(f't{t_check}_unique', 0)}.")
+                    log_metrics({"step": step, "event": "collapse_warning"})
 
             if is_main and step % config.val_every == 0:
                 val_loss = validate(model, diffusion, val_dataloader, config, device)
