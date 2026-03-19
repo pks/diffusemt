@@ -2,7 +2,7 @@ import argparse
 import torch
 from config import Config
 from model import SourceCorruptionEncoderDecoder, SourceCorruptionEncoderOnly
-from diffusion import SourceCorruptionDiffusion
+from diffusion import SourceCorruptionDiffusion, MaskDiffusion
 from transformers import AutoTokenizer
 
 
@@ -140,7 +140,8 @@ def main():
     del checkpoint
     print(f"Loaded checkpoint from step {step}")
 
-    diffusion = SourceCorruptionDiffusion(
+    diffusion_cls = MaskDiffusion if getattr(config, 'diffusion_type', 'source') == 'mask' else SourceCorruptionDiffusion
+    diffusion = diffusion_cls(
         timesteps=config.timesteps,
         mask_token_id=config.mask_token_id,
         schedule=config.schedule,

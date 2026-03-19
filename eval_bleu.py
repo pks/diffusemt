@@ -3,7 +3,7 @@ import argparse
 import torch
 from torch.utils.data import DataLoader
 from config import Config
-from diffusion import SourceCorruptionDiffusion
+from diffusion import SourceCorruptionDiffusion, MaskDiffusion
 from dataset import TranslationDataset
 from translate import build_model
 from transformers import AutoTokenizer
@@ -36,7 +36,8 @@ def main():
     print(f"Loaded checkpoint from step {step}")
     print(f"Sampling: temperature={args.temperature}, num_steps={args.num_steps or config.timesteps}")
 
-    diffusion = SourceCorruptionDiffusion(
+    diffusion_cls = MaskDiffusion if getattr(config, 'diffusion_type', 'source') == 'mask' else SourceCorruptionDiffusion
+    diffusion = diffusion_cls(
         timesteps=config.timesteps,
         mask_token_id=config.mask_token_id,
         schedule=config.schedule,

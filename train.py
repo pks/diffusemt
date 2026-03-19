@@ -8,7 +8,7 @@ import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from config import Config
 from model import SourceCorruptionEncoderDecoder, SourceCorruptionEncoderOnly
-from diffusion import SourceCorruptionDiffusion
+from diffusion import SourceCorruptionDiffusion, MaskDiffusion
 from dataset import get_dataloader
 
 
@@ -203,11 +203,14 @@ def train(resume_from=None):
               f"{trainable_params / 1e6:.1f}M trainable, "
               f"{frozen_params / 1e6:.1f}M frozen")
 
-    diffusion = SourceCorruptionDiffusion(
+    diffusion_cls = MaskDiffusion if getattr(config, 'diffusion_type', 'source') == 'mask' else SourceCorruptionDiffusion
+    diffusion = diffusion_cls(
         timesteps=config.timesteps,
         mask_token_id=config.mask_token_id,
         schedule=config.schedule,
     ).to(device)
+    if is_main:
+        print(f"Diffusion: {diffusion_cls.__name__}")
 
     # Only optimize trainable parameters
     trainable_params = [p for p in model.parameters() if p.requires_grad]

@@ -21,7 +21,8 @@ class Config:
     # Diffusion
     timesteps: int = 200
     schedule: str = "cosine"
-    mask_token_id: int = 103  # [MASK] for bert-base-multilingual-cased (fallback noise)
+    mask_token_id: int = 103  # [MASK] for bert-base-multilingual-cased
+    diffusion_type: str = "mask"  # "source" (English-as-noise) or "mask" ([MASK]-based)
 
     # Training
     batch_size: int = 64
@@ -33,7 +34,7 @@ class Config:
     log_every: int = 50
     val_every: int = 2500
     save_every: int = 10000
-    checkpoint_dir: str = "checkpoints_v24_encoder_only"
+    checkpoint_dir: str = "checkpoints_v25_mask_diffusion"
     grad_clip: float = 0.5
 
     # Diffusion-only training (no AR warmup phase)
