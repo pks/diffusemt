@@ -454,3 +454,26 @@ Currently training.
 - Tokenized versions:
   - `data/wmt14_en_de_tokenized[_test]` — bert-base-multilingual-cased (120K vocab)
   - `data/wmt14_en_de_bert_cased[_test]` — bert-base-cased (29K vocab)
+
+### v25 — Mask diffusion (MDLM-style) — NEW BEST
+
+- **Architecture**: Same as v24: `SourceCorruptionEncoderOnly`, 12-layer Pre-LN, 512d, 131.9M total (40.1M trainable, 91.8M frozen mBERT embeddings)
+- **Key change from v24**: diffusion_type="mask" — target tokens replaced with [MASK], source tokens provided as clean context (not as noise)
+- **Training**: Same as v24 (pure diffusion, curriculum ramp 1→200 over 50K steps, 200K steps total)
+  - Effective batch: 1024 (bs=64 × grad_accum=8 × 2 GPUs)
+  - Final checkpoint saved: 190K (200K step finished but NCCL crash on broadcast prevented save)
+- **Val loss trajectory**: 3.71→3.18→2.67→2.35→2.14→2.08→2.03→1.95→1.96→1.96→1.94→1.85→1.82→1.83→**1.758** (180K best)→1.86 (190K)
+- **Results (190K, 50 steps, temp=2.0)**:
+  - **BLEU: 13.60** — new record (beats v22 13.30, v24 12.73)
+  - hyp_len/ref_len ratio: 1.082 (slight over-generation)
+  - t50_acc=78%, t100_acc=60%, t200_acc=22% — healthy
+- **Key finding**: Mask diffusion > source-as-corruption. Clean signal separation (source as context, target masked) outperforms mixing source tokens into target noise.
+- **Checkpoint**: `checkpoints_v25_mask_diffusion/model_step_190000.pt` (best available; 180K also available with lower val_loss)
+
+### v26 — Deeper model (24 layers) initialized from v25
+
+- **Architecture**: `SourceCorruptionEncoderOnly`, 24-layer Pre-LN, 512d, 169.7M total (77.9M trainable, 91.8M frozen)
+  - Initialized from v25 190K checkpoint by layer stacking: layers 0-11 = v25 layers 0-11, layers 12-23 = repeat of v25 layers 0-11
+- **Training config**: batch_size=32, grad_accum=16, effective_batch=1024, lr=1e-4, warmup=2K, curriculum_end_step=0 (full t_max=200 from step 0)
+- **Init checkpoint**: `checkpoints_v26_deeper_init.pt`
+- **Status**: Pending

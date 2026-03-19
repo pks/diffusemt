@@ -12,7 +12,7 @@ class Config:
     architecture: str = "encoder-only"  # "encoder-decoder" or "encoder-only"
     encoder_layers: int = 6
     decoder_layers: int = 6
-    num_layers: int = 12  # for encoder-only architecture
+    num_layers: int = 24  # for encoder-only architecture (v26: doubled from v25's 12)
     ff_dim: int = 2048
     dropout: float = 0.1
     max_seq_len: int = 128
@@ -25,8 +25,8 @@ class Config:
     diffusion_type: str = "mask"  # "source" (English-as-noise) or "mask" ([MASK]-based)
 
     # Training
-    batch_size: int = 64
-    grad_accum_steps: int = 8
+    batch_size: int = 48      # 24-layer model on TITAN RTX 24GB (single-GPU peak 19.6 GB; DDP adds ~2 GB)
+    grad_accum_steps: int = 11  # effective batch = 48 × 2 GPUs × 11 = 1056 ≈ v25's 1024
     lr: float = 1e-4
     warmup_steps: int = 2000
     label_smoothing: float = 0.1
@@ -34,12 +34,12 @@ class Config:
     log_every: int = 50
     val_every: int = 2500
     save_every: int = 10000
-    checkpoint_dir: str = "checkpoints_v25_mask_diffusion"
+    checkpoint_dir: str = "checkpoints_v26_deeper"
     grad_clip: float = 0.5
 
     # Diffusion-only training (no AR warmup phase)
     ar_steps: int = 0                   # no autoregressive warmup
-    curriculum_end_step: int = 50000    # t_max reaches T at this step
+    curriculum_end_step: int = 0        # v26: start at full t_max=200 (init from trained weights)
     curriculum_t_start: int = 1         # start curriculum at t_max=1
 
     # Auxiliary losses

@@ -145,7 +145,7 @@ def health_check(model, diffusion, config, device,
     return results, collapsed
 
 
-def train(resume_from=None):
+def train(resume_from=None, init_from=None):
     config = Config()
 
     # DDP setup
@@ -233,7 +233,7 @@ def train(resume_from=None):
     if is_main:
         os.makedirs(config.checkpoint_dir, exist_ok=True)
 
-    # Resume
+    # Resume or init from checkpoint
     step = 0
     epoch = 0
     if resume_from is not None:
@@ -250,6 +250,14 @@ def train(resume_from=None):
         del ckpt
         if is_main:
             print(f"Resumed from checkpoint at step {step}")
+    elif init_from is not None:
+        # Load model weights only — fresh optimizer, start from step 0
+        ckpt = torch.load(init_from, map_location="cpu", weights_only=False)
+        raw_model.load_state_dict(ckpt["model"])
+        src_step = ckpt.get("source_step", ckpt.get("step", "?"))
+        del ckpt
+        if is_main:
+            print(f"Initialized model weights from {init_from} (source step {src_step}), training from step 0")
 
     health_check_steps = {500, 1000, 2000, 5000}
     log_path = os.path.join(config.checkpoint_dir, "metrics.jsonl")
@@ -432,6 +440,7 @@ def train(resume_from=None):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--resume", type=str, default=None, help="Path to checkpoint to resume from")
+    parser.add_argument("--resume", type=str, default=None, help="Path to checkpoint to resume (model + optimizer + step)")
+    parser.add_argument("--init-from", type=str, default=None, help="Path to checkpoint to init model weights only (fresh optimizer, step=0)")
     args = parser.parse_args()
-    train(resume_from=args.resume)
+    train(resume_from=args.resume, init_from=args.init_from)
