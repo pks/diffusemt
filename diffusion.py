@@ -322,8 +322,13 @@ class MaskDiffusion(nn.Module):
 
     @torch.no_grad()
     def p_sample_loop(self, model, source_ids, source_mask, target_mask,
-                      num_steps=None, temperature=1.0):
-        """Full reverse process: start from all [MASK], denoise to German."""
+                      num_steps=None, temperature=1.0, stochastic=False):
+        """Full reverse process: start from all [MASK], denoise to German.
+
+        Args:
+            stochastic: if True, sample from distribution on non-final steps
+                        (adds diversity; least-confident positions get re-masked)
+        """
         B = source_ids.shape[0]
         L = target_mask.shape[1]
         device = source_ids.device
@@ -356,19 +361,26 @@ class MaskDiffusion(nn.Module):
                 logits = logits / temperature
 
             probs = torch.softmax(logits, dim=-1)
-            pred_tokens = probs.argmax(dim=-1)
-            confidence = probs.max(dim=-1).values
 
-            if i + 1 < len(step_indices):
+            is_final = (i + 1 >= len(step_indices))
+            if stochastic and not is_final:
+                # Sample from distribution (non-final steps)
+                flat_probs = probs.view(-1, probs.shape[-1])
+                sampled = torch.multinomial(flat_probs, 1).squeeze(-1)
+                pred_tokens = sampled.view(B, L)
+                confidence = flat_probs.gather(1, sampled.unsqueeze(1)).squeeze(1).view(B, L)
+            else:
+                # Argmax (final step or deterministic mode)
+                pred_tokens = probs.argmax(dim=-1)
+                confidence = probs.max(dim=-1).values
+
+            if not is_final:
                 next_t = step_indices[i + 1]
                 gamma_next = self.gamma[next_t]
-            else:
-                gamma_next = 0.0
 
-            n_gen = gen_mask.sum(dim=-1).float()
-            n_mask_next = (gamma_next * n_gen).long().clamp(min=0)
+                n_gen = gen_mask.sum(dim=-1).float()
+                n_mask_next = (gamma_next * n_gen).long().clamp(min=0)
 
-            if i + 1 < len(step_indices):
                 new_ids = current_ids.clone()
                 new_ids[gen_mask] = pred_tokens[gen_mask]
 

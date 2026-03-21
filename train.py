@@ -4,10 +4,11 @@ import math
 import argparse
 import json
 import torch
+import torch.nn.functional as F
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from config import Config
-from model import SourceCorruptionEncoderDecoder, SourceCorruptionEncoderOnly
+from model import SourceCorruptionEncoderDecoder, SourceCorruptionEncoderOnly, LengthPredictor
 from diffusion import SourceCorruptionDiffusion, MaskDiffusion
 from dataset import get_dataloader
 
@@ -212,8 +213,22 @@ def train(resume_from=None, init_from=None):
     if is_main:
         print(f"Diffusion: {diffusion_cls.__name__}")
 
+    # Length predictor (separate from DDP model, shares embeddings to save memory)
+    length_predictor = None
+    if config.length_loss_weight > 0:
+        length_predictor = LengthPredictor(
+            word_embeddings=raw_model.word_embeddings,  # shared, not copied
+            embed_dim=config.embed_dim,
+            hidden_dim=config.model_dim,
+        ).to(device)
+        if is_main:
+            lp_params = sum(p.numel() for p in length_predictor.parameters() if p.requires_grad)
+            print(f"Length predictor: {lp_params / 1e3:.1f}K trainable params (shared embeddings)")
+
     # Only optimize trainable parameters
     trainable_params = [p for p in model.parameters() if p.requires_grad]
+    if length_predictor is not None:
+        trainable_params += [p for p in length_predictor.parameters() if p.requires_grad]
     optimizer = torch.optim.AdamW(trainable_params, lr=config.lr, weight_decay=0.01)
 
     warmup_steps = config.warmup_steps
@@ -240,6 +255,8 @@ def train(resume_from=None, init_from=None):
         ckpt = torch.load(resume_from, map_location="cpu", weights_only=False)
         raw_model.load_state_dict(ckpt["model"])
         optimizer.load_state_dict(ckpt["optimizer"])
+        if length_predictor is not None and "length_predictor" in ckpt:
+            length_predictor.load_state_dict(ckpt["length_predictor"])
         step = ckpt["step"]
         for state in optimizer.state.values():
             for k, v in state.items():
@@ -252,12 +269,15 @@ def train(resume_from=None, init_from=None):
             print(f"Resumed from checkpoint at step {step}")
     elif init_from is not None:
         # Load model weights only — fresh optimizer, start from step 0
+        # strict=False: allows new modules (e.g. length_predictor) to keep random init
         ckpt = torch.load(init_from, map_location="cpu", weights_only=False)
-        raw_model.load_state_dict(ckpt["model"])
+        missing, unexpected = raw_model.load_state_dict(ckpt["model"], strict=False)
         src_step = ckpt.get("source_step", ckpt.get("step", "?"))
         del ckpt
         if is_main:
             print(f"Initialized model weights from {init_from} (source step {src_step}), training from step 0")
+            if missing:
+                print(f"  New parameters (randomly initialized): {missing}")
 
     health_check_steps = {500, 1000, 2000, 5000}
     log_path = os.path.join(config.checkpoint_dir, "metrics.jsonl")
@@ -324,12 +344,19 @@ def train(resume_from=None, init_from=None):
                                    source_ids=source_ids, source_mask=source_mask,
                                    causal=False)
 
-                # x0-parameterization: CE on all real target positions
+                # x0-parameterization: weighted CE on all real target positions
+                # Masked positions get weight 1.0, uncorrupted positions get lower weight
                 loss_mask = target_mask.bool()
                 if loss_mask.sum() > 0:
-                    loss = torch.nn.functional.cross_entropy(
+                    per_token_loss = F.cross_entropy(
                         logits[loss_mask].float(), target_ids[loss_mask],
-                        label_smoothing=config.label_smoothing)
+                        label_smoothing=config.label_smoothing, reduction='none')
+                    # Build per-token weights
+                    weights = torch.ones(B, target_ids.shape[1], device=device)
+                    uncorrupted = loss_mask & ~is_corrupted
+                    weights[uncorrupted] = config.uncorrupted_loss_weight
+                    w = weights[loss_mask]
+                    loss = (per_token_loss * w).sum() / w.sum()
                 else:
                     loss = torch.tensor(0.0, device=device)
 
@@ -358,7 +385,15 @@ def train(resume_from=None, init_from=None):
                 # Negative because we want to MAXIMIZE entropy (minimize negative entropy)
                 div_loss = -entropy
 
-            total_loss = loss + config.aux_mlm_weight * aux_loss + config.diversity_weight * div_loss
+            # Length prediction auxiliary loss (separate module, no DDP conflict)
+            length_loss = torch.tensor(0.0, device=device)
+            if length_predictor is not None:
+                with torch.amp.autocast("cuda", dtype=torch.float16):
+                    pred_len = length_predictor(source_ids, source_mask)
+                actual_len = target_mask.float().sum(dim=-1)
+                length_loss = F.mse_loss(pred_len.float(), actual_len)
+
+            total_loss = loss + config.aux_mlm_weight * aux_loss + config.diversity_weight * div_loss + config.length_loss_weight * length_loss
             total_loss = total_loss / config.grad_accum_steps
             scaler.scale(total_loss).backward()
 
@@ -416,22 +451,28 @@ def train(resume_from=None, init_from=None):
 
             if is_main and step % config.save_every == 0:
                 path = os.path.join(config.checkpoint_dir, f"model_step_{step}.pt")
-                torch.save({
+                save_dict = {
                     "step": step,
                     "model": raw_model.state_dict(),
                     "optimizer": optimizer.state_dict(),
                     "config": config,
-                }, path)
+                }
+                if length_predictor is not None:
+                    save_dict["length_predictor"] = length_predictor.state_dict()
+                torch.save(save_dict, path)
                 print(f"Saved checkpoint: {path}")
 
     if is_main:
         path = os.path.join(config.checkpoint_dir, "model_final.pt")
-        torch.save({
+        save_dict = {
             "step": step,
             "model": raw_model.state_dict(),
             "optimizer": optimizer.state_dict(),
             "config": config,
-        }, path)
+        }
+        if length_predictor is not None:
+            save_dict["length_predictor"] = length_predictor.state_dict()
+        torch.save(save_dict, path)
         print(f"Training complete. Final checkpoint: {path}")
 
     if distributed:

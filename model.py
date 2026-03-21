@@ -461,3 +461,51 @@ class SourceCorruptionEncoderOnly(nn.Module):
         source_hidden = x[:, :L_src, :]
         h = self.aux_mlm_head(source_hidden)
         return h @ self.output_embedding.T
+
+
+class LengthPredictor(nn.Module):
+    """Standalone target length predictor from source embeddings.
+
+    Separate from the main model to avoid DDP conflicts.
+    Shares frozen mBERT embeddings with the main model to save GPU memory.
+    """
+
+    def __init__(self, word_embeddings, embed_dim=768, hidden_dim=512):
+        """
+        Args:
+            word_embeddings: nn.Embedding — shared frozen mBERT embeddings (not owned)
+        """
+        super().__init__()
+        self.word_embeddings = word_embeddings  # shared reference, not a copy
+
+        self.proj = nn.Linear(embed_dim, hidden_dim)
+        self.head = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, 1),
+        )
+        self._init_weights()
+
+    def _init_weights(self):
+        nn.init.xavier_uniform_(self.proj.weight)
+        nn.init.zeros_(self.proj.bias)
+        for m in self.head.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight)
+                nn.init.zeros_(m.bias)
+
+    def forward(self, source_ids, source_mask):
+        """Predict target token count from source.
+
+        Args:
+            source_ids: (B, L_src) source token IDs
+            source_mask: (B, L_src) bool, True = real token
+        Returns:
+            (B,) predicted target length
+        """
+        with torch.no_grad():
+            x = self.word_embeddings(source_ids)  # (B, L_src, embed_dim)
+        x = self.proj(x)  # (B, L_src, hidden_dim)
+        mask = source_mask.unsqueeze(-1).float()
+        pooled = (x * mask).sum(dim=1) / mask.sum(dim=1).clamp(min=1)
+        return self.head(pooled).squeeze(-1)
