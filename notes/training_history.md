@@ -202,6 +202,7 @@ Config: 512d/8L, T=1000, bs=8192/GPU, **lr=1e-4**, warmup=1K, cosine decay to 10
 | 500 | 20.6% (17) | 20.6% (16) | 19.4% (14) | 18.1% (9) | 3.5% (3) | 1.23 | 0.06 |
 | 1000 | 93.3% (411) | 93.0% (416) | 68.5% (285) | 37.9% (94) | 3.2% (4) | 1.11 | 0.08 |
 | 2000 | **100% (448)** | **100% (448)** | **99.6% (449)** | 57.0% (206) | 3.1% (5) | 1.02 | 0.07 |
+| 2500 | 87.2% (410) | 88.0% (412) | 86.5% (409) | 59.5% (263) | 3.1% (7) | 1.00 | 0.08 |
 
 **Key observations:**
 - Step 500 looks borderline (17 unique) but recovers dramatically by step 1000 (411 unique)
@@ -213,7 +214,9 @@ Config: 512d/8L, T=1000, bs=8192/GPU, **lr=1e-4**, warmup=1K, cosine decay to 10
 
 **Training speed:** ~8 steps/min (500 steps in ~63 min). Checkpoints saved every 500 steps early, every 2500 steps later.
 
-**Status as of step 2300:** Loss=1.005, grad_norm=0.07, LR=9.98e-5 (just past peak, cosine decay beginning). Training is rock solid. Next health check at step 2500 (val_every).
+**Validation at step 2500:** val_loss=0.3453 — significantly better than v18's 0.63 at same step. t=0 dipped to 87% (from 100% at step 2000) but 410 unique tokens is excellent. t=750 improved to 59.5% (263 unique). Training continues stable.
+
+**Status as of step 2550:** Loss=0.998, grad_norm=0.06. Training rock solid through step 2500 milestone.
 
 **Launch command:**
 ```bash
