@@ -347,6 +347,9 @@ class SourceCorruptionEncoderOnly(nn.Module):
         )
         self.output_bias = nn.Parameter(torch.zeros(self.vocab_size))
 
+        # Self-conditioning: project previous x0 prediction into model space
+        self.self_cond_proj = nn.Linear(embed_dim, model_dim)
+
         # Auxiliary MLM head (for encoder gradient signal)
         self.aux_mlm_head = nn.Sequential(
             nn.Linear(model_dim, model_dim),
@@ -365,6 +368,10 @@ class SourceCorruptionEncoderOnly(nn.Module):
                     nn.init.xavier_uniform_(m.weight)
                     if m.bias is not None:
                         nn.init.zeros_(m.bias)
+
+        # Init self_cond_proj to near-zero so it's a no-op at start (safe for init-from)
+        nn.init.zeros_(self.self_cond_proj.weight)
+        nn.init.zeros_(self.self_cond_proj.bias)
 
         scale = 1.0 / math.sqrt(2.0 * n_layers)
         for layer in self.layers:
@@ -395,7 +402,7 @@ class SourceCorruptionEncoderOnly(nn.Module):
 
     def forward(self, input_ids, padding_mask, t,
                 source_ids=None, source_mask=None, encoder_output=None,
-                causal=False):
+                causal=False, self_cond_ids=None):
         """
         Args:
             input_ids: (B, L) corrupted target tokens
@@ -403,6 +410,7 @@ class SourceCorruptionEncoderOnly(nn.Module):
             t: (B,) timestep indices
             source_ids: (B, L_src) English source tokens
             source_mask: (B, L_src) bool, True = valid source position
+            self_cond_ids: (B, L) previous x0 prediction token IDs (optional)
         Returns:
             logits: (B, L, vocab_size) predictions for target tokens
         """
@@ -424,6 +432,14 @@ class SourceCorruptionEncoderOnly(nn.Module):
             torch.ones(B, L_tgt, device=device, dtype=torch.long),
         ], dim=1)
         x = x + self.segment_embedding(seg)
+
+        # Self-conditioning: add projected embedding of previous x0 prediction
+        if self_cond_ids is not None:
+            with torch.no_grad():
+                sc_emb = self.word_embeddings(self_cond_ids)
+            sc = self.self_cond_proj(sc_emb)
+            # Add to target positions only
+            x[:, L_src:, :] = x[:, L_src:, :] + sc
 
         x = self.embed_drop(self.embed_norm(x))
 

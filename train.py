@@ -146,7 +146,7 @@ def health_check(model, diffusion, config, device,
     return results, collapsed
 
 
-def train(resume_from=None, init_from=None):
+def train(resume_from=None, init_from=None, distilled=False):
     config = Config()
 
     # DDP setup
@@ -242,8 +242,11 @@ def train(resume_from=None, init_from=None):
 
     scaler = torch.amp.GradScaler("cuda")
 
-    dataloader, sampler = get_dataloader(config, split="train", distributed=distributed)
+    train_split = "train_distilled" if distilled else "train"
+    dataloader, sampler = get_dataloader(config, split=train_split, distributed=distributed)
     val_dataloader, _ = get_dataloader(config, split="test", distributed=False)
+    if is_main and distilled:
+        print(f"Training on DISTILLED data ({train_split})")
 
     if is_main:
         os.makedirs(config.checkpoint_dir, exist_ok=True)
@@ -339,10 +342,19 @@ def train(resume_from=None, init_from=None):
                 corrupted, is_corrupted = diffusion.q_sample(
                     source_ids, source_mask, target_ids, target_mask, t)
 
+                # Self-conditioning: 50% of the time, get a detached x0 prediction first
+                self_cond_ids = None
+                if getattr(config, 'self_cond', False) and torch.rand(1).item() < 0.5:
+                    with torch.no_grad(), torch.amp.autocast("cuda", dtype=torch.float16):
+                        sc_logits = model(corrupted, target_mask, t,
+                                          source_ids=source_ids, source_mask=source_mask,
+                                          causal=False)
+                        self_cond_ids = sc_logits.argmax(dim=-1).detach()
+
                 with torch.amp.autocast("cuda", dtype=torch.float16):
                     logits = model(corrupted, target_mask, t,
                                    source_ids=source_ids, source_mask=source_mask,
-                                   causal=False)
+                                   causal=False, self_cond_ids=self_cond_ids)
 
                 # x0-parameterization: weighted CE on all real target positions
                 # Masked positions get weight 1.0, uncorrupted positions get lower weight
@@ -425,6 +437,7 @@ def train(resume_from=None, init_from=None):
                 running_aux_loss = 0.0
 
             if is_main and (step in health_check_steps or step % config.val_every == 0) and get_t_max(step, config) != -1:
+                torch.cuda.empty_cache()
                 curr_t_max = get_t_max(step, config)
                 hc_results, collapsed = health_check(
                     model, diffusion, config, device,
@@ -445,11 +458,14 @@ def train(resume_from=None, init_from=None):
                     log_metrics({"step": step, "event": "collapse_warning"})
 
             if is_main and step % config.val_every == 0:
+                torch.cuda.empty_cache()
                 val_loss = validate(model, diffusion, val_dataloader, config, device)
                 print(f"Step {step} | Val Loss: {val_loss:.4f}")
                 log_metrics({"step": step, "val_loss": round(val_loss, 4)})
+                torch.cuda.empty_cache()
 
             if is_main and step % config.save_every == 0:
+                torch.cuda.empty_cache()
                 path = os.path.join(config.checkpoint_dir, f"model_step_{step}.pt")
                 save_dict = {
                     "step": step,
@@ -483,5 +499,6 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--resume", type=str, default=None, help="Path to checkpoint to resume (model + optimizer + step)")
     parser.add_argument("--init-from", type=str, default=None, help="Path to checkpoint to init model weights only (fresh optimizer, step=0)")
+    parser.add_argument("--distilled", action="store_true", help="Train on distilled data (knowledge distillation)")
     args = parser.parse_args()
-    train(resume_from=args.resume, init_from=args.init_from)
+    train(resume_from=args.resume, init_from=args.init_from, distilled=args.distilled)

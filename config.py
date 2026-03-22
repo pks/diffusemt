@@ -17,6 +17,7 @@ class Config:
     dropout: float = 0.1
     max_seq_len: int = 128
     freeze_embeddings: bool = True
+    self_cond: bool = True  # v28: self-conditioning (feed prev x0 prediction as input)
 
     # Diffusion
     timesteps: int = 200
@@ -24,24 +25,24 @@ class Config:
     mask_token_id: int = 103  # [MASK] for bert-base-multilingual-cased
     diffusion_type: str = "mask"  # "source" (English-as-noise) or "mask" ([MASK]-based)
 
-    # Training
-    batch_size: int = 48      # 24-layer model on TITAN RTX 24GB (single-GPU peak 19.6 GB; DDP adds ~2 GB)
-    grad_accum_steps: int = 11  # effective batch = 48 × 2 GPUs × 11 = 1056 ≈ v25's 1024
-    lr: float = 2e-5          # v27b: gentler LR for fine-tuning (5e-5 was too aggressive)
-    warmup_steps: int = 1000
+    # Training — v29: knowledge distillation from MarianMT + self-conditioning
+    batch_size: int = 32      # reduced from 48 for self-cond double forward pass
+    grad_accum_steps: int = 16  # effective batch = 32 × 2 GPUs × 16 = 1024
+    lr: float = 2e-5          # gentle fine-tuning on distilled data
+    warmup_steps: int = 500
     label_smoothing: float = 0.1
-    num_train_steps: int = 100000
+    num_train_steps: int = 50000
     log_every: int = 50
     val_every: int = 2500
     save_every: int = 5000
-    checkpoint_dir: str = "checkpoints_v27b"
+    checkpoint_dir: str = "checkpoints_v29"
     grad_clip: float = 0.5
 
-    # Loss weighting (v27): upweight masked positions, downweight uncorrupted
-    uncorrupted_loss_weight: float = 0.1
+    # Loss weighting: uniform (v27b's 0.1 didn't improve BLEU over uniform)
+    uncorrupted_loss_weight: float = 1.0
 
-    # Length predictor (v27)
-    length_loss_weight: float = 0.2
+    # Length predictor (disabled — hurt BLEU in v27b)
+    length_loss_weight: float = 0.0
 
     # Diffusion-only training (no AR warmup phase)
     ar_steps: int = 0                   # no autoregressive warmup

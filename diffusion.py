@@ -322,21 +322,30 @@ class MaskDiffusion(nn.Module):
 
     @torch.no_grad()
     def p_sample_loop(self, model, source_ids, source_mask, target_mask,
-                      num_steps=None, temperature=1.0, stochastic=False):
+                      num_steps=None, temperature=1.0, stochastic=False,
+                      anneal_temperature=False, start_ids=None,
+                      self_cond=False):
         """Full reverse process: start from all [MASK], denoise to German.
 
         Args:
             stochastic: if True, sample from distribution on non-final steps
                         (adds diversity; least-confident positions get re-masked)
+            anneal_temperature: if True, linearly anneal temperature from
+                                `temperature` → 1.0 over the sampling steps
+            start_ids: if provided, start from these IDs instead of all [MASK]
+            self_cond: if True, pass previous step's predictions as self_cond_ids
         """
         B = source_ids.shape[0]
         L = target_mask.shape[1]
         device = source_ids.device
 
-        # Start from fully masked state
-        current_ids = torch.full((B, L), self.mask_token_id,
-                                 device=device, dtype=torch.long)
-        current_ids[~target_mask] = 0
+        if start_ids is not None:
+            current_ids = start_ids.clone()
+        else:
+            # Start from fully masked state
+            current_ids = torch.full((B, L), self.mask_token_id,
+                                     device=device, dtype=torch.long)
+            current_ids[~target_mask] = 0
         gen_mask = target_mask.clone()
 
         enc_out = None
@@ -350,15 +359,26 @@ class MaskDiffusion(nn.Module):
         else:
             step_indices = list(range(self.timesteps, 0, -1))
 
+        prev_pred = None  # for self-conditioning
+        n_steps = len(step_indices)
         for i, t in enumerate(step_indices):
             t_tensor = torch.full((B,), t, device=device, dtype=torch.long)
 
+            sc_ids = prev_pred if self_cond else None
             logits = model(current_ids, target_mask, t_tensor,
                            source_ids=source_ids, source_mask=source_mask,
-                           encoder_output=enc_out)
+                           encoder_output=enc_out, self_cond_ids=sc_ids)
 
-            if temperature != 1.0:
-                logits = logits / temperature
+            # Compute step-specific temperature
+            if anneal_temperature and temperature != 1.0:
+                # Linearly anneal: temperature at step 0 → 1.0 at final step
+                frac = i / max(n_steps - 1, 1)
+                step_temp = temperature * (1.0 - frac) + 1.0 * frac
+            else:
+                step_temp = temperature
+
+            if step_temp != 1.0:
+                logits = logits / step_temp
 
             probs = torch.softmax(logits, dim=-1)
 
@@ -395,6 +415,10 @@ class MaskDiffusion(nn.Module):
                 current_ids = new_ids
             else:
                 current_ids[gen_mask] = pred_tokens[gen_mask]
+
+            # Save full prediction for self-conditioning
+            if self_cond:
+                prev_pred = pred_tokens.clone()
 
         return current_ids
 
