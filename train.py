@@ -436,11 +436,20 @@ def train(resume_from=None, init_from=None, distilled=False):
                 running_loss = 0.0
                 running_aux_loss = 0.0
 
-            if is_main and (step in health_check_steps or step % config.val_every == 0) and get_t_max(step, config) != -1:
+            # Determine eval/save needs on ALL ranks so barriers are symmetric
+            do_health = (step in health_check_steps or step % config.val_every == 0) and get_t_max(step, config) != -1
+            do_val = step % config.val_every == 0
+            do_save = step % config.save_every == 0
+
+            # Barrier: all ranks sync before rank-0 eval/save (prevents NCCL timeout)
+            if distributed and (do_health or do_val or do_save):
+                dist.barrier()
+
+            if is_main and do_health:
                 torch.cuda.empty_cache()
                 curr_t_max = get_t_max(step, config)
                 hc_results, collapsed = health_check(
-                    model, diffusion, config, device,
+                    raw_model, diffusion, config, device,
                     iter(dataloader), dataloader, sampler, epoch,
                     current_t_max=curr_t_max)
                 t_check = curr_t_max
@@ -457,14 +466,14 @@ def train(resume_from=None, init_from=None, distilled=False):
                           f"t={t_check} unique tokens = {hc_results.get(f't{t_check}_unique', 0)}.")
                     log_metrics({"step": step, "event": "collapse_warning"})
 
-            if is_main and step % config.val_every == 0:
+            if is_main and do_val:
                 torch.cuda.empty_cache()
-                val_loss = validate(model, diffusion, val_dataloader, config, device)
+                val_loss = validate(raw_model, diffusion, val_dataloader, config, device)
                 print(f"Step {step} | Val Loss: {val_loss:.4f}")
                 log_metrics({"step": step, "val_loss": round(val_loss, 4)})
                 torch.cuda.empty_cache()
 
-            if is_main and step % config.save_every == 0:
+            if is_main and do_save:
                 torch.cuda.empty_cache()
                 path = os.path.join(config.checkpoint_dir, f"model_step_{step}.pt")
                 save_dict = {
@@ -477,6 +486,14 @@ def train(resume_from=None, init_from=None, distilled=False):
                     save_dict["length_predictor"] = length_predictor.state_dict()
                 torch.save(save_dict, path)
                 print(f"Saved checkpoint: {path}")
+
+            # Barrier: all ranks sync after rank-0 eval/save
+            if distributed and (do_health or do_val or do_save):
+                dist.barrier()
+
+    # Barrier: all ranks sync before final save (prevents NCCL timeout at end of training)
+    if distributed:
+        dist.barrier()
 
     if is_main:
         path = os.path.join(config.checkpoint_dir, "model_final.pt")
@@ -492,6 +509,7 @@ def train(resume_from=None, init_from=None, distilled=False):
         print(f"Training complete. Final checkpoint: {path}")
 
     if distributed:
+        dist.barrier()
         cleanup_ddp()
 
 

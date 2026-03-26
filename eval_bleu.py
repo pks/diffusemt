@@ -35,11 +35,20 @@ def main():
 
     tokenizer = AutoTokenizer.from_pretrained(config.tokenizer_name)
 
-    # Infer actual layer count from checkpoint (handles mismatches with current config)
+    # Use checkpoint's stored config if available (handles architecture mismatches)
     checkpoint = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
-    layer_keys = [k for k in checkpoint["model"] if k.startswith("layers.")]
-    if layer_keys:
-        config.num_layers = max(int(k.split(".")[1]) for k in layer_keys) + 1
+    if "config" in checkpoint:
+        ckpt_config = checkpoint["config"]
+        for attr in ["model_dim", "embed_dim", "num_heads", "num_layers", "ff_dim",
+                      "max_seq_len", "timesteps", "schedule", "mask_token_id",
+                      "diffusion_type", "self_cond"]:
+            if hasattr(ckpt_config, attr):
+                setattr(config, attr, getattr(ckpt_config, attr))
+    else:
+        # Fallback: infer layer count from checkpoint keys
+        layer_keys = [k for k in checkpoint["model"] if k.startswith("layers.")]
+        if layer_keys:
+            config.num_layers = max(int(k.split(".")[1]) for k in layer_keys) + 1
     model = build_model(config, device)
     model.load_state_dict(checkpoint["model"], strict=False)
     has_length_predictor = "length_predictor" in checkpoint

@@ -476,4 +476,158 @@ Currently training.
   - Initialized from v25 190K checkpoint by layer stacking: layers 0-11 = v25 layers 0-11, layers 12-23 = repeat of v25 layers 0-11
 - **Training config**: batch_size=32, grad_accum=16, effective_batch=1024, lr=1e-4, warmup=2K, curriculum_end_step=0 (full t_max=200 from step 0)
 - **Init checkpoint**: `checkpoints_v26_deeper_init.pt`
-- **Status**: Pending
+- **Results**:
+  - val_loss: **1.71** (converged by ~45K steps)
+  - Health check: t=100 acc=65%, t=200 acc=26%
+  - **BLEU: 18.41** (200 sentences, temp=2.0, 200 steps) — major jump from v25's 13.60
+  - Depth scaling paid off: 24 layers + v25 init + mask diffusion = best result yet
+- **Status**: COMPLETE. Checkpoint: `checkpoints_v26/model_step_50000.pt`
+
+### v27b — Weighted loss + length predictor (ablation)
+
+- **Goal**: Test two hypotheses — (1) down-weight loss on uncorrupted positions, (2) train a length predictor
+- **Config changes from v26**: `uncorrupted_loss_weight=0.1`, `length_loss_weight=0.2`, lr=2e-5
+- **Architecture**: Same 24-layer encoder-only + standalone `LengthPredictor` (frozen mBERT embeddings → mean pool → MLP → scalar)
+- **OOM fixes required**:
+  - Step 10K: health check + validation + checkpoint save all fire simultaneously → OOM
+  - Fix: Added `torch.cuda.empty_cache()` before health check, before/after validation, before save
+  - Step 12.5K: memory fragmentation (9.84 GiB reserved but unallocated)
+  - Fix: `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` environment variable
+- **Results**:
+  - val_loss: **1.5697** (lower than v26's 1.71 — weighted loss helps optimization)
+  - Health check: t=100 acc=64%, t=200 acc=23%
+  - **BLEU: 18.36** (200 sentences, temp=2.0) — essentially identical to v26 despite better val_loss
+  - Length predictor BLEU: **13.11** — predictions too short, destroyed quality
+- **Conclusion**: Weighted loss improves val_loss but not BLEU. Length predictor actively harmful. Both disabled for future runs.
+- **Status**: COMPLETE. Checkpoint: `checkpoints_v27b/`
+
+### v28 — Self-conditioning
+
+- **Goal**: Feed model's own previous x0 prediction as additional input (MDLM self-conditioning)
+- **Architecture changes**:
+  - Added `self_cond_proj = nn.Linear(embed_dim, model_dim)` initialized to zeros (gradual activation)
+  - During training: 50% of iterations run a no-grad forward pass first, feed argmax predictions as `self_cond_ids`
+  - During inference: pass previous step's predictions to next step in reverse diffusion loop
+- **Config**: batch_size=32 (reduced for double forward pass), grad_accum=16, lr=3e-5, initialized from v26 checkpoint
+- **Results**:
+  - val_loss: ~1.71 (similar to v26)
+  - Health check: t=100 acc=89% (dramatic jump from v26's 65%)
+  - Self-cond decoding: +0.33 BLEU on 200 sentences at best — not significant on full test set
+  - **BLEU: ~18.4** — no meaningful improvement over v26
+- **Conclusion**: Self-conditioning massively improves health check accuracy but doesn't translate to BLEU gains. The model already makes good predictions; self-conditioning just confirms them.
+- **Status**: COMPLETE. Checkpoint: `checkpoints_v28/`
+
+### v29 — Knowledge distillation from MarianMT
+
+- **Goal**: Replace noisy WMT14 reference translations with clean AR teacher outputs
+- **Distillation pipeline** (`distill.py`):
+  - Teacher: Helsinki-NLP/opus-mt-en-de (MarianMT), greedy decoding
+  - MarianMT BLEU: 23.59 on 200 test sentences (strong teacher)
+  - Translated 1M training sentences, saved as HuggingFace dataset
+  - Re-tokenized with mBERT tokenizer for compatibility
+- **Config**: lr=2e-5, warmup=500, 50K steps, self_cond=True, initialized from v26 checkpoint
+- **Results**:
+  - val_loss: ~1.65 (slightly better than v26, but val set uses original references)
+  - Health check: t=100 acc=89% (matches v28's self-cond boost)
+  - **BLEU (full 3003 test set): 18.39** — essentially identical to v26's 18.41
+- **Conclusion**: Distilled data doesn't help. The model may already be extracting what it can from the training signal; cleaner targets don't change the output quality.
+- **Status**: COMPLETE. Checkpoint: `checkpoints_v29/`
+
+---
+
+## Decoding Experiments (v26-v29)
+
+Exhaustive search over decoding hyperparameters, all tested on v26/v27b/v28/v29 checkpoints:
+
+| Setting | BLEU | Notes |
+|---------|------|-------|
+| Baseline (temp=2.0, 200 steps, deterministic) | **18.41** | v26 default |
+| Stochastic sampling (temp=1.5) | 0.03 | Catastrophically bad |
+| Stochastic sampling (temp=0.5) | 16.90 | Below baseline even with low temp |
+| Temperature sweep (1.0–3.0) | 17.8–18.4 | temp=2.0 is optimal |
+| Step sweep (50, 100, 200) | 18.0–18.4 | Diminishing returns past 100 |
+| Temperature annealing | ~18.3 | No improvement |
+| Reranking (K=4, stochastic) | ~18.2 | Stochastic candidates too noisy |
+| Refinement (re-denoise from t=20) | ~18.3 | No improvement |
+| Self-conditioning during decode | ~18.5 | Marginal, not significant |
+| Length predictor | 13.11 | Actively harmful (too short) |
+| Length ratio sweep (0.9–1.3) | 17.5–18.4 | 1.1× optimal |
+
+**Key finding**: The ~18.4 BLEU ceiling is fundamental to the architecture, not a decoding artifact. No combination of decoding improvements breaks through.
+
+---
+
+## BLEU Ceiling Analysis
+
+All v26+ experiments converge to **~18.4 BLEU** regardless of:
+- Loss weighting (uniform vs down-weighted uncorrupted positions)
+- Self-conditioning (marginal health check improvement, no BLEU change)
+- Training data quality (original WMT14 vs MarianMT-distilled)
+- Decoding strategy (temperature, steps, stochastic, reranking, refinement)
+
+**Possible explanations for the ceiling**:
+1. **Architectural**: 24-layer encoder-only with shared [source|target] sequence may lack the capacity for fine-grained cross-lingual alignment that encoder-decoder cross-attention provides
+2. **Diffusion process**: Mask-predict with confidence-based unmasking may have inherent limitations vs autoregressive left-to-right generation for translation
+3. **Tokenizer mismatch**: mBERT tokenizer (119K vocab) not optimized for EN→DE translation
+4. **For reference**: MarianMT (AR teacher) achieves 23.59 BLEU; state-of-the-art discrete diffusion translation papers report ~25-27 BLEU on WMT14 EN→DE with dedicated architectures
+
+---
+
+## Phase 6: Width Scaling Experiment (v30-v31)
+
+**Hypothesis**: Wider model (768d) matching mBERT's embedding dimension would eliminate the embed_proj bottleneck and improve BLEU.
+
+### v30b — 768d, 24-layer, NCCL crash
+
+- **Architecture**: 768d model_dim (matches embed_dim), 12 heads, 24 layers, 3072 ff_dim
+- **Key change**: model_dim == embed_dim → embed_proj becomes a 768→768 linear (potentially identity)
+- **Config**: batch_size=32, grad_accum=16, effective_batch=1024, lr=1e-4
+- **Training**: Initialized from v26 weights, fresh optimizer
+- **Result**: **CRASHED** at ~100K steps with SIGABRT (NCCL timeout)
+  - Root cause: rank-0 health check/eval blocks while rank-1 tries to sync → NCCL deadlock
+  - BLEU before crash (200 sentences only): **13.99** — worse than v26 despite wider model
+- **Lesson**: DDP requires symmetric barrier placement for eval/save operations
+
+### v31 — 768d, 24-layer, identity init + NCCL fix
+
+- **Architecture**: Same as v30b (768d, 12 heads, 24 layers, 3072 ff_dim)
+- **Key fixes over v30b**:
+  1. **Identity embed_proj init**: When embed_dim == model_dim, initialize embed_proj as identity matrix instead of random Xavier. Random init was scrambling the frozen BERT embedding geometry.
+  2. **NCCL barrier fix**: Added `dist.barrier()` before AND after eval/save blocks so both DDP ranks sync symmetrically. Prevents the timeout that killed v30b.
+- **Config**: batch_size=32, grad_accum=16, effective_batch=1024, lr=1e-4, warmup=2K, 200K steps
+- **Training**: Completed full 200K steps successfully, no crashes
+- **Val loss progression**:
+  - Best: **1.6929** (step 185K)
+  - Final (200K): 1.7991
+  - Oscillated throughout (normal for this architecture)
+- **BLEU (full newstest2014, 3003 sentences)**:
+  - Step 185K (best val): **15.75**
+  - Step 200K (final): **15.83**
+- **Conclusion**: **768d is WORSE than 512d by 2.69 BLEU** (15.83 vs 18.52). Width scaling does not help — the 512d model with learned 768→512 projection outperforms the wider model despite the embedding bottleneck. The extra parameters in wider attention/FF layers don't compensate.
+- **Status**: COMPLETE. Checkpoints: `checkpoints_v31/`
+
+### Width Scaling Summary
+
+| Version | Width | Layers | Params (trainable) | BLEU (3003) |
+|---------|-------|--------|--------------------|-------------|
+| **v26** | **512d** | **24** | **~97M** | **18.52** |
+| v30b | 768d | 24 | ~175M | 13.99* |
+| v31 | 768d | 24 | ~175M | 15.83 |
+
+*v30b: 200 sentences only, crashed at 100K steps
+
+**Takeaway**: More parameters via width scaling hurt rather than helped. The 768→512 embed_proj may actually be a beneficial bottleneck, forcing the model to learn a more compressed and useful representation. Going wider nearly doubled the parameter count but reduced BLEU by 14%.
+
+---
+
+## Phase 7: Depth Scaling (v32)
+
+**Hypothesis**: Since width scaling failed but depth worked (v25→v26: 12→24 layers = +5 BLEU), try even more depth at 512d.
+
+### v32 — 512d, 32-layer (initialized from v26)
+
+- **Architecture**: 512d model_dim, 8 heads, 32 layers, 2048 ff_dim
+- **Initialization**: Layer stacking from v26 190K checkpoint — layers 0-23 from v26, layers 24-31 = copy of v26 layers 0-7
+- **Config**: batch_size=40, grad_accum=13, effective_batch=1040, lr=1e-4, warmup=2K, 200K steps
+- **Init checkpoint**: `checkpoints_v32_init.pt`
+- **Status**: Starting training

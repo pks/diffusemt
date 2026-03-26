@@ -369,6 +369,12 @@ class SourceCorruptionEncoderOnly(nn.Module):
                     if m.bias is not None:
                         nn.init.zeros_(m.bias)
 
+        # When embed_dim == model_dim, init embed_proj as identity to preserve
+        # frozen BERT embedding geometry (random init scrambles it)
+        if self.embed_proj.in_features == self.embed_proj.out_features:
+            nn.init.eye_(self.embed_proj.weight)
+            nn.init.zeros_(self.embed_proj.bias)
+
         # Init self_cond_proj to near-zero so it's a no-op at start (safe for init-from)
         nn.init.zeros_(self.self_cond_proj.weight)
         nn.init.zeros_(self.self_cond_proj.bias)
