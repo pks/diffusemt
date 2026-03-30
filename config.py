@@ -32,7 +32,7 @@ class Config:
     lr: float = 1e-4           # standard peak LR
     warmup_steps: int = 2000
     label_smoothing: float = 0.1
-    num_train_steps: int = 200000
+    num_train_steps: int = 300000
     log_every: int = 50
     val_every: int = 2500
     save_every: int = 5000

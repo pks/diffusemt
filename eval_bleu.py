@@ -23,6 +23,8 @@ def main():
     parser.add_argument("--stochastic", action="store_true", help="Use stochastic sampling for non-final steps")
     parser.add_argument("--anneal-temperature", action="store_true", help="Linearly anneal temperature from base → 1.0")
     parser.add_argument("--rerank", type=int, default=1, help="Generate K candidates per sentence, pick best by model score")
+    parser.add_argument("--mbr", type=int, default=1, help="MBR decoding: generate N candidates, pick by inter-candidate chrF")
+    parser.add_argument("--mbr-metric", type=str, default="chrf", choices=["chrf", "bleu"], help="MBR utility metric")
     parser.add_argument("--refine-steps", type=int, default=0, help="After initial decode, re-denoise from this timestep (0=off)")
     parser.add_argument("--self-cond", action="store_true", help="Use self-conditioning during decoding")
     args = parser.parse_args()
@@ -109,7 +111,53 @@ def main():
 
         # Generate (fp16 for speed)
         with torch.no_grad(), torch.amp.autocast("cuda", dtype=torch.float16):
-            if args.rerank > 1:
+            if args.mbr > 1:
+                # MBR decoding: generate N candidates, pick by inter-candidate similarity
+                N = args.mbr
+                all_candidates = []
+                for _k in range(N):
+                    cand_ids = diffusion.p_sample_loop(
+                        model, source_ids, source_mask, tgt_masks,
+                        num_steps=args.num_steps, temperature=args.temperature,
+                        stochastic=True, anneal_temperature=args.anneal_temperature)
+                    all_candidates.append(cand_ids)
+                all_candidates = torch.stack(all_candidates, dim=0)  # (N, B, L)
+
+                # Decode all candidates to strings for MBR scoring
+                cand_strings = []  # (N, B) list of lists
+                for k in range(N):
+                    batch_strs = []
+                    for i in range(B):
+                        batch_strs.append(tokenizer.decode(all_candidates[k, i], skip_special_tokens=True))
+                    cand_strings.append(batch_strs)
+
+                # MBR selection: for each sentence, pick candidate with highest avg utility
+                if args.mbr_metric == "chrf":
+                    mbr_scorer = sacrebleu.CHRF()
+                else:
+                    mbr_scorer = sacrebleu.BLEU(effective_order=True)
+
+                best_cands = []
+                for i in range(B):
+                    candidates_i = [cand_strings[k][i] for k in range(N)]
+                    best_score = -1
+                    best_idx = 0
+                    for k in range(N):
+                        # Average utility of candidate k against all others
+                        scores = []
+                        for j in range(N):
+                            if j == k:
+                                continue
+                            s = mbr_scorer.sentence_score(candidates_i[k], [candidates_i[j]])
+                            scores.append(s.score)
+                        avg = sum(scores) / len(scores)
+                        if avg > best_score:
+                            best_score = avg
+                            best_idx = k
+                    best_cands.append(best_idx)
+                output_ids = torch.stack([all_candidates[best_cands[i], i] for i in range(B)])
+
+            elif args.rerank > 1:
                 # Generate K candidates per sample, pick best by avg log-prob
                 K = args.rerank
                 all_candidates = []
@@ -157,7 +205,11 @@ def main():
             if n_done >= args.n:
                 break
 
-            hyp = tokenizer.decode(output_ids[i], skip_special_tokens=True)
+            if args.mbr > 1:
+                # Already decoded during MBR — use the selected candidate string
+                hyp = [cand_strings[k][i] for k in range(args.mbr)][best_cands[i]]
+            else:
+                hyp = tokenizer.decode(output_ids[i], skip_special_tokens=True)
             ref = tokenizer.decode(target_ids[i][target_mask[i].bool()], skip_special_tokens=True)
             src = tokenizer.decode(source_ids[i][source_mask[i].bool()], skip_special_tokens=True)
 
