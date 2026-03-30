@@ -200,9 +200,12 @@ def train(resume_from=None, init_from=None, distilled=False):
         total_params = sum(p.numel() for p in raw_model.parameters())
         trainable_params = sum(p.numel() for p in raw_model.parameters() if p.requires_grad)
         frozen_params = total_params - trainable_params
+        embed_count = sum(p.numel() for p in raw_model.word_embeddings.parameters() if p.requires_grad)
         print(f"Model params: {total_params / 1e6:.1f}M total, "
               f"{trainable_params / 1e6:.1f}M trainable, "
               f"{frozen_params / 1e6:.1f}M frozen")
+        if embed_count > 0:
+            print(f"  Unfrozen embeddings: {embed_count / 1e6:.1f}M params at LR {getattr(config, 'embed_lr', config.lr):.1e}")
 
     diffusion_cls = MaskDiffusion if getattr(config, 'diffusion_type', 'source') == 'mask' else SourceCorruptionDiffusion
     diffusion = diffusion_cls(
@@ -225,11 +228,20 @@ def train(resume_from=None, init_from=None, distilled=False):
             lp_params = sum(p.numel() for p in length_predictor.parameters() if p.requires_grad)
             print(f"Length predictor: {lp_params / 1e3:.1f}K trainable params (shared embeddings)")
 
-    # Only optimize trainable parameters
-    trainable_params = [p for p in model.parameters() if p.requires_grad]
+    # Separate param groups: low LR for pretrained embeddings, normal LR for rest
+    embed_param_ids = {id(p) for p in raw_model.word_embeddings.parameters()}
+    embed_params = [p for p in model.parameters() if p.requires_grad and id(p) in embed_param_ids]
+    other_params = [p for p in model.parameters() if p.requires_grad and id(p) not in embed_param_ids]
     if length_predictor is not None:
-        trainable_params += [p for p in length_predictor.parameters() if p.requires_grad]
-    optimizer = torch.optim.AdamW(trainable_params, lr=config.lr, weight_decay=0.01)
+        other_params += [p for p in length_predictor.parameters() if p.requires_grad]
+
+    embed_lr = getattr(config, 'embed_lr', config.lr)
+    param_groups = [
+        {"params": other_params, "lr": config.lr},
+        {"params": embed_params, "lr": embed_lr},
+    ]
+    optimizer = torch.optim.AdamW(param_groups, weight_decay=0.01)
+    trainable_params = other_params + embed_params  # flat list for grad clipping
 
     warmup_steps = config.warmup_steps
     total_opt_steps = config.num_train_steps // config.grad_accum_steps

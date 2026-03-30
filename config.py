@@ -3,20 +3,21 @@ from dataclasses import dataclass
 
 @dataclass
 class Config:
-    # Model — v32: deeper 512d (32 layers), back from 768d which underperformed
+    # Model — v33: unfreeze mBERT embeddings with differential LR
     pretrained_name: str = "bert-base-multilingual-cased"
     vocab_size: int = 119547
     embed_dim: int = 768       # embedding dimension (mBERT)
-    model_dim: int = 512       # v32: back to 512d (v26 baseline width)
-    num_heads: int = 8         # v32: 8 heads × 64d = 512
+    model_dim: int = 512       # same as v32
+    num_heads: int = 8         # 8 heads × 64d = 512
     architecture: str = "encoder-only"  # "encoder-decoder" or "encoder-only"
     encoder_layers: int = 6
     decoder_layers: int = 6
-    num_layers: int = 32       # v32: deeper (was 24 in v26)
-    ff_dim: int = 2048         # v32: 4× model_dim
+    num_layers: int = 32       # same as v32
+    ff_dim: int = 2048         # 4× model_dim
     dropout: float = 0.1
     max_seq_len: int = 128
-    freeze_embeddings: bool = True
+    freeze_embeddings: bool = False  # v33: unfreeze for fine-tuning
+    embed_lr: float = 1e-5           # v33: low LR for pretrained embeddings
     self_cond: bool = False
 
     # Diffusion
@@ -25,9 +26,9 @@ class Config:
     mask_token_id: int = 103  # [MASK] for bert-base-multilingual-cased
     diffusion_type: str = "mask"  # "source" (English-as-noise) or "mask" ([MASK]-based)
 
-    # Training — v32: 512d×32L fits batch 40/GPU on TITAN RTX 24GB
-    batch_size: int = 40
-    grad_accum_steps: int = 13 # effective batch = 40 × 2 GPUs × 13 = 1040
+    # Training — v33: reduced batch for unfrozen embedding gradient memory (~1GB extra)
+    batch_size: int = 36
+    grad_accum_steps: int = 15 # effective batch = 36 × 2 GPUs × 15 = 1080
     lr: float = 1e-4           # standard peak LR
     warmup_steps: int = 2000
     label_smoothing: float = 0.1
@@ -35,7 +36,7 @@ class Config:
     log_every: int = 50
     val_every: int = 2500
     save_every: int = 5000
-    checkpoint_dir: str = "checkpoints_v32"
+    checkpoint_dir: str = "checkpoints_v33"
     grad_clip: float = 0.5
 
     # Loss weighting: uniform (v27b's 0.1 didn't improve BLEU over uniform)
