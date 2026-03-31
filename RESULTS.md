@@ -21,7 +21,8 @@ All scores on the **full 3003-sentence** WMT14 newstest2014 test set unless note
 | v31 | Encoder-only 24L×768d | Width scaling + fixes | 15.83 | — | Wider = worse (-2.6 BLEU vs v26) |
 | **v32** | **Encoder-only 32L×512d** | **More depth (from v26)** | **19.62** | temp=2.0, 200 steps | 103.5M trainable; best result |
 | v32 | | | 19.42 | temp=1.0, 200 steps | Lower temp slightly worse on full set |
-| **v33** | **Encoder-only 32L×512d** | **Unfrozen mBERT embeddings** | **20.71** | temp=1.0, 200 steps | 195.3M trainable; init from v32; new best |
+| v33 | Encoder-only 32L×512d | Unfrozen mBERT embeddings | 20.71 | temp=1.0, 200 steps | 195.3M trainable; init from v32; 200K steps |
+| **v33 ext** | **Encoder-only 32L×512d** | **Extended training (300K)** | **20.95** | temp=1.0, 200 steps | Best at 285K (val_loss 1.3659); new best |
 
 ## Key Findings
 
@@ -29,8 +30,9 @@ All scores on the **full 3003-sentence** WMT14 newstest2014 test set unless note
 2. **~18.4 BLEU ceiling at 24L**: Weighted loss, self-conditioning, knowledge distillation all converged to ~18.4
 3. **Depth broke the ceiling**: v32's 32 layers pushed from 18.4 → 19.6 (+1.2 BLEU)
 4. **Unfrozen embeddings broke it again**: v33 unfreezing mBERT embeddings (differential LR 1e-5) pushed 19.6 → 20.7 (+1.1 BLEU)
-5. **Decoding tuning is marginal**: Sweep showed max +0.1 BLEU from decoding params alone
-6. **Reference**: MarianMT (autoregressive) = 23.59 BLEU; SOTA discrete diffusion = ~25-27 BLEU
+5. **Extended training helps marginally**: v33 ext (200K→300K) gained +0.24 BLEU (20.71→20.95); best checkpoint at 285K, not 300K
+6. **Decoding tuning is marginal**: Sweep showed max +0.1 BLEU from decoding params alone
+7. **Reference**: MarianMT (autoregressive) = 23.59 BLEU; SOTA discrete diffusion = ~25-27 BLEU
 
 ## v32 Decoding Sweep (500 sentences)
 

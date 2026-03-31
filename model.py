@@ -39,7 +39,7 @@ class PreLNEncoderLayer(nn.Module):
         # Pre-norm self-attention
         h = self.norm1(x)
         h, _ = self.self_attn(h, h, h, key_padding_mask=src_key_padding_mask,
-                              attn_mask=attn_mask)
+                              attn_mask=attn_mask, need_weights=False)
         x = x + h
         # Pre-norm feedforward
         x = x + self.ff(self.norm2(x))
@@ -69,11 +69,12 @@ class PreLNDecoderLayer(nn.Module):
         # Pre-norm self-attention (with optional causal mask)
         h = self.norm1(x)
         h, _ = self.self_attn(h, h, h, key_padding_mask=tgt_key_padding_mask,
-                              attn_mask=attn_mask)
+                              attn_mask=attn_mask, need_weights=False)
         x = x + h
         # Pre-norm cross-attention
         h = self.norm2(x)
-        h, _ = self.cross_attn(h, memory, memory, key_padding_mask=memory_key_padding_mask)
+        h, _ = self.cross_attn(h, memory, memory, key_padding_mask=memory_key_padding_mask,
+                               need_weights=False)
         x = x + h
         # Pre-norm feedforward
         x = x + self.ff(self.norm3(x))

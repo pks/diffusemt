@@ -34,5 +34,5 @@ def get_dataloader(config, split="train", distributed=False):
     return DataLoader(
         dataset, batch_size=config.batch_size,
         shuffle=(split == "train" and sampler is None),
-        sampler=sampler, num_workers=0, pin_memory=True,
+        sampler=sampler, num_workers=4, pin_memory=True, persistent_workers=True,
     ), sampler

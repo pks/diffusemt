@@ -148,6 +148,7 @@ def health_check(model, diffusion, config, device,
 
 def train(resume_from=None, init_from=None, distilled=False):
     config = Config()
+    torch.backends.cudnn.benchmark = True
 
     # DDP setup
     distributed = "RANK" in os.environ
@@ -192,7 +193,10 @@ def train(resume_from=None, init_from=None, distilled=False):
         ).to(device)
 
     if distributed:
-        model = DDP(model, device_ids=[local_rank], find_unused_parameters=True)
+        model = DDP(model, device_ids=[local_rank], static_graph=True)
+
+    # Note: torch.compile fails with Inductor codegen on Turing GPUs (SM 7.5)
+    # Other optimizations active: SDPA (need_weights=False), static_graph, cudnn.benchmark
 
     raw_model = model.module if distributed else model
 
@@ -429,7 +433,7 @@ def train(resume_from=None, init_from=None, distilled=False):
                 torch.nn.utils.clip_grad_norm_(trainable_params, config.grad_clip)
                 scaler.step(optimizer)
                 scaler.update()
-                optimizer.zero_grad()
+                optimizer.zero_grad(set_to_none=True)
                 scheduler.step()
 
             step += 1
