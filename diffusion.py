@@ -324,7 +324,7 @@ class MaskDiffusion(nn.Module):
     def p_sample_loop(self, model, source_ids, source_mask, target_mask,
                       num_steps=None, temperature=1.0, stochastic=False,
                       anneal_temperature=False, start_ids=None,
-                      self_cond=False):
+                      self_cond=False, cfg_weight=0.0):
         """Full reverse process: start from all [MASK], denoise to German.
 
         Args:
@@ -334,6 +334,7 @@ class MaskDiffusion(nn.Module):
                                 `temperature` → 1.0 over the sampling steps
             start_ids: if provided, start from these IDs instead of all [MASK]
             self_cond: if True, pass previous step's predictions as self_cond_ids
+            cfg_weight: classifier-free guidance weight (0=off, >0 amplifies source conditioning)
         """
         B = source_ids.shape[0]
         L = target_mask.shape[1]
@@ -352,6 +353,13 @@ class MaskDiffusion(nn.Module):
         if hasattr(model, 'encode_source'):
             enc_out = model.encode_source(source_ids, source_mask)
 
+        # Pre-compute unconditional encoder output for CFG
+        uncond_source_ids = None
+        uncond_source_mask = None
+        if cfg_weight > 0:
+            uncond_source_ids = torch.zeros_like(source_ids)
+            uncond_source_mask = torch.zeros_like(source_mask)
+
         if num_steps is not None and num_steps < self.timesteps:
             step_indices = torch.linspace(self.timesteps, 1, num_steps).long().tolist()
             if step_indices[-1] != 1:
@@ -368,6 +376,14 @@ class MaskDiffusion(nn.Module):
             logits = model(current_ids, target_mask, t_tensor,
                            source_ids=source_ids, source_mask=source_mask,
                            encoder_output=enc_out, self_cond_ids=sc_ids)
+
+            # Classifier-free guidance: amplify source conditioning
+            if cfg_weight > 0:
+                logits_uncond = model(current_ids, target_mask, t_tensor,
+                                      source_ids=uncond_source_ids,
+                                      source_mask=uncond_source_mask,
+                                      self_cond_ids=sc_ids)
+                logits = logits_uncond + (1.0 + cfg_weight) * (logits - logits_uncond)
 
             # Compute step-specific temperature
             if anneal_temperature and temperature != 1.0:

@@ -3,7 +3,7 @@ from dataclasses import dataclass
 
 @dataclass
 class Config:
-    # Model — v34: deeper (40L), init from best v33 (285K)
+    # Model — v34: best model (21.18 BLEU), 40-layer encoder-only, mask diffusion
     pretrained_name: str = "bert-base-multilingual-cased"
     vocab_size: int = 119547
     embed_dim: int = 768       # embedding dimension (mBERT)
@@ -12,12 +12,12 @@ class Config:
     architecture: str = "encoder-only"  # "encoder-decoder" or "encoder-only"
     encoder_layers: int = 6
     decoder_layers: int = 6
-    num_layers: int = 40       # v34: 32→40 layers
+    num_layers: int = 40       # v34: 40 layers (best BLEU)
     ff_dim: int = 2048         # 4× model_dim
     dropout: float = 0.1
     max_seq_len: int = 128
-    freeze_embeddings: bool = False  # v33: unfreeze for fine-tuning
-    embed_lr: float = 1e-5           # v33: low LR for pretrained embeddings
+    freeze_embeddings: bool = False  # v33+: unfreeze for fine-tuning
+    embed_lr: float = 1e-5           # v33+: low LR for pretrained embeddings
     self_cond: bool = False
 
     # Diffusion
@@ -26,10 +26,13 @@ class Config:
     mask_token_id: int = 103  # [MASK] for bert-base-multilingual-cased
     diffusion_type: str = "mask"  # "source" (English-as-noise) or "mask" ([MASK]-based)
 
-    # Training — v34: 40 layers, unfrozen embeddings, torch.compile + SDPA optimizations
+    # Classifier-free guidance: disabled (v35 showed CFG hurts for discrete diffusion)
+    cfg_dropout: float = 0.0
+
+    # Training — v34: 40 layers, unfrozen embeddings
     batch_size: int = 36
     grad_accum_steps: int = 15 # effective batch = 36 × 2 GPUs × 15 = 1080
-    lr: float = 1e-4           # standard peak LR
+    lr: float = 1e-4
     warmup_steps: int = 2000
     label_smoothing: float = 0.1
     num_train_steps: int = 200000

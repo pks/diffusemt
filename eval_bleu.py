@@ -27,6 +27,7 @@ def main():
     parser.add_argument("--mbr-metric", type=str, default="chrf", choices=["chrf", "bleu"], help="MBR utility metric")
     parser.add_argument("--refine-steps", type=int, default=0, help="After initial decode, re-denoise from this timestep (0=off)")
     parser.add_argument("--self-cond", action="store_true", help="Use self-conditioning during decoding")
+    parser.add_argument("--cfg-weight", type=float, default=0.0, help="Classifier-free guidance weight (0=off, >0 amplifies source conditioning)")
     args = parser.parse_args()
 
     config = Config()
@@ -67,7 +68,8 @@ def main():
     del checkpoint
     print(f"Loaded checkpoint from step {step}")
     print(f"Sampling: temperature={args.temperature}, num_steps={args.num_steps or config.timesteps}, "
-          f"stochastic={args.stochastic}, length_predictor={'trained' if has_length_predictor else 'none'}")
+          f"stochastic={args.stochastic}, cfg_weight={args.cfg_weight}, "
+          f"length_predictor={'trained' if has_length_predictor else 'none'}")
 
     diffusion_cls = MaskDiffusion if getattr(config, 'diffusion_type', 'source') == 'mask' else SourceCorruptionDiffusion
     diffusion = diffusion_cls(
@@ -188,7 +190,8 @@ def main():
                     num_steps=args.num_steps, temperature=args.temperature,
                     stochastic=args.stochastic,
                     anneal_temperature=args.anneal_temperature,
-                    self_cond=args.self_cond)
+                    self_cond=args.self_cond,
+                    cfg_weight=args.cfg_weight)
 
             # Optional refinement: corrupt output lightly and re-denoise
             if args.refine_steps > 0:

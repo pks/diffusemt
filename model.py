@@ -314,8 +314,11 @@ class SourceCorruptionEncoderOnly(nn.Module):
 
         del bert
 
-        # Project from embedding dim to model dim
-        self.embed_proj = nn.Linear(embed_dim, model_dim)
+        # Project from embedding dim to model dim (only when they differ)
+        if embed_dim != model_dim:
+            self.embed_proj = nn.Linear(embed_dim, model_dim)
+        else:
+            self.embed_proj = None
 
         # Learned position embeddings (for concatenated sequence, 2x max_seq_len)
         self.pos_embedding = nn.Embedding(max_seq_len * 2, model_dim)
@@ -341,11 +344,14 @@ class SourceCorruptionEncoderOnly(nn.Module):
         ])
         self.output_norm = nn.LayerNorm(model_dim)
 
-        # Output head
-        self.output_proj = nn.Sequential(
-            nn.Linear(model_dim, embed_dim),
-            nn.GELU(),
-        )
+        # Output head: project to embed_dim for logit computation (skip if dims match)
+        if embed_dim != model_dim:
+            self.output_proj = nn.Sequential(
+                nn.Linear(model_dim, embed_dim),
+                nn.GELU(),
+            )
+        else:
+            self.output_proj = None
         self.output_bias = nn.Parameter(torch.zeros(self.vocab_size))
 
         # Self-conditioning: project previous x0 prediction into model space
@@ -363,16 +369,18 @@ class SourceCorruptionEncoderOnly(nn.Module):
 
     def _init_weights(self):
         n_layers = len(self.layers)
-        for module in [self.embed_proj, self.time_proj, self.aux_mlm_head]:
+        init_modules = [self.time_proj, self.aux_mlm_head]
+        if self.embed_proj is not None:
+            init_modules.append(self.embed_proj)
+        for module in init_modules:
             for m in module.modules() if hasattr(module, 'modules') else [module]:
                 if isinstance(m, nn.Linear):
                     nn.init.xavier_uniform_(m.weight)
                     if m.bias is not None:
                         nn.init.zeros_(m.bias)
 
-        # When embed_dim == model_dim, init embed_proj as identity to preserve
-        # frozen BERT embedding geometry (random init scrambles it)
-        if self.embed_proj.in_features == self.embed_proj.out_features:
+        # When embed_dim == model_dim but embed_proj exists, init as identity
+        if self.embed_proj is not None and self.embed_proj.in_features == self.embed_proj.out_features:
             nn.init.eye_(self.embed_proj.weight)
             nn.init.zeros_(self.embed_proj.bias)
 
@@ -393,11 +401,12 @@ class SourceCorruptionEncoderOnly(nn.Module):
             if ff_layers:
                 ff_layers[-1].weight.data *= scale
 
-        for m in self.output_proj.modules():
-            if isinstance(m, nn.Linear):
-                nn.init.normal_(m.weight, std=0.02 / math.sqrt(n_layers))
-                if m.bias is not None:
-                    nn.init.zeros_(m.bias)
+        if self.output_proj is not None:
+            for m in self.output_proj.modules():
+                if isinstance(m, nn.Linear):
+                    nn.init.normal_(m.weight, std=0.02 / math.sqrt(n_layers))
+                    if m.bias is not None:
+                        nn.init.zeros_(m.bias)
 
         nn.init.normal_(self.pos_embedding.weight, std=0.02)
         nn.init.normal_(self.segment_embedding.weight, std=0.02)
@@ -431,7 +440,10 @@ class SourceCorruptionEncoderOnly(nn.Module):
 
         # Position embeddings
         pos = torch.arange(L_total, device=device).unsqueeze(0)
-        x = self.embed_proj(self.word_embeddings(concat_ids)) + self.pos_embedding(pos)
+        word_emb = self.word_embeddings(concat_ids)
+        if self.embed_proj is not None:
+            word_emb = self.embed_proj(word_emb)
+        x = word_emb + self.pos_embedding(pos)
 
         # Segment embeddings
         seg = torch.cat([
@@ -475,7 +487,10 @@ class SourceCorruptionEncoderOnly(nn.Module):
 
         # Extract target positions and project to vocab
         target_hidden = x[:, L_src:, :]  # (B, L_tgt, model_dim)
-        h = self.output_proj(target_hidden)
+        if self.output_proj is not None:
+            h = self.output_proj(target_hidden)
+        else:
+            h = target_hidden
         logits = h @ self.output_embedding.T + self.output_bias
         return logits
 

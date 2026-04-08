@@ -329,6 +329,13 @@ def train(resume_from=None, init_from=None, distilled=False):
             # Two-phase training
             t_max = get_t_max(step, config)
 
+            # Classifier-free guidance: randomly drop source conditioning
+            cfg_dropout = getattr(config, 'cfg_dropout', 0.0)
+            if cfg_dropout > 0 and t_max != -1 and torch.rand(1).item() < cfg_dropout:
+                # Replace source with empty (all padding) for unconditional training
+                source_ids = torch.zeros_like(source_ids)
+                source_mask = torch.zeros_like(source_mask)
+
             if t_max == -1:
                 # Phase 1: Autoregressive seq2seq with teacher forcing
                 # Input: shifted target (prepend [CLS], drop last token)

@@ -630,4 +630,91 @@ All v26+ experiments converge to **~18.4 BLEU** regardless of:
 - **Initialization**: Layer stacking from v26 190K checkpoint — layers 0-23 from v26, layers 24-31 = copy of v26 layers 0-7
 - **Config**: batch_size=40, grad_accum=13, effective_batch=1040, lr=1e-4, warmup=2K, 200K steps
 - **Init checkpoint**: `checkpoints_v32_init.pt`
-- **Status**: Starting training
+- **Results**:
+  - val_loss: best **1.44** (step 170K)
+  - **BLEU: 19.62** (temp=2.0, 200 steps, full 3003 sentences)
+  - BLEU: 19.42 (temp=1.0)
+  - t100_acc=73%, t200_acc=23% — healthy
+- **Status**: COMPLETE. Checkpoint: `checkpoints_v32/`
+
+### v33 — Unfrozen mBERT embeddings (from v32)
+
+- **Architecture**: Same 32-layer, but `freeze_embeddings=False` with differential LR
+- **Key change**: Unfreeze mBERT word embeddings at embed_lr=1e-5 (10× lower than main LR)
+- **Config**: batch_size=40, grad_accum=13, effective_batch=1040, lr=1e-4, embed_lr=1e-5, 200K steps
+- **Initialization**: From v32 best checkpoint (200K)
+- **Results (200K)**:
+  - val_loss: best **1.3911** (step 165K)
+  - **BLEU: 20.71** (temp=1.0, 200 steps) — new best (+1.09 over v32)
+  - 195.3M total, 103.5M trainable (91.8M from unfrozen embeddings)
+- **Status**: COMPLETE. Checkpoint: `checkpoints_v33/`
+
+### v33 ext — Extended training (300K steps)
+
+- **Key change**: Resumed v33 200K with fresh cosine schedule to 300K
+- **Results (300K)**:
+  - val_loss: best **1.3659** (step 285K)
+  - **BLEU: 20.95** (temp=1.0, 200 steps) — new best (+0.24 from extended training)
+  - Best at 285K, not 300K (slight overfitting at end)
+- **Status**: COMPLETE. Checkpoint: `checkpoints_v33/model_step_285000.pt`
+
+### v34 — 40-layer depth scaling (from v33 ext 285K)
+
+- **Architecture**: 40-layer, 512d, unfrozen embeddings
+- **Key changes from v33**: +8 layers (32→40), label_smoothing=0.1, grad_clip=0.5
+- **Config**: batch_size=36, grad_accum=15, effective_batch=1080, lr=1e-4, 200K steps
+- **Initialization**: From v33 ext 285K (layer stacking: 0-31 from v33, 32-39 = copy of layers 0-7)
+- **Results (200K)**:
+  - val_loss: best **1.4123** (step 10K), oscillated 1.42-1.56, final 1.511
+  - val_loss WORSE than v33 ext (1.41 vs 1.37) — extra layers didn't help
+  - Health: t50_acc=87.4%, t100_acc=71.7%, t200_acc=21.7%
+  - **BLEU: 21.18** (step 165K) / **21.02** (step 200K) — **new best!**
+  - Surprising: worse val_loss (1.41 vs 1.37) but better BLEU (+0.23 over v33 ext)
+- **Key finding**: 40 layers DOES help BLEU despite worse val_loss. Val_loss ≠ BLEU. Deeper model generates more coherent sequences even with higher per-token loss.
+- **Status**: COMPLETE. Checkpoint: `checkpoints_v34/`
+
+---
+
+## Phase 8: Classifier-Free Guidance (v35)
+
+**Hypothesis**: Amplifying source→target conditioning signal during inference via CFG will improve translation quality without changing the architecture.
+
+### v35 — CFG training (source dropout)
+
+- **Architecture**: Same as v33 (32-layer, 512d, unfrozen embeddings)
+- **Key change**: During training, 10% of steps use empty source (cfg_dropout=0.1)
+  - This teaches the model both conditional P(target|source) and unconditional P(target)
+  - At inference: logits = logits_cond + w * (logits_cond - logits_uncond) for w > 0
+- **Config**: batch_size=40, grad_accum=13, effective_batch=1040, lr=5e-5, warmup=1K, 100K steps
+- **Initialization**: From v33 ext 285K (best model, BLEU 20.95)
+- **Results (100K)**:
+  - val_loss: best **1.3127** (step 70K), oscillatory due to CFG dropout noise
+  - val_loss beat v33 ext (1.31 vs 1.37) but with more variance
+  - **Baseline BLEU** (no CFG): ~21.2 (500 sentences) — matches v34's best
+  - **CFG BLEU sweep**: CFG HURTS at all weights:
+    - w=0 (baseline): 21.2 | w=0.5: 20.4 | w=1.0: 19.2-19.6 | w=1.5: 18.5 | w=2.0: 17.7 | w=3.0: 16.2-16.4
+  - CFG degrades BLEU monotonically — the unconditional mode P(target) pulls away from correct translations
+- **Key finding**: CFG doesn't work for discrete diffusion translation. Unlike image generation, amplifying the (cond - uncond) signal in token space harms output quality. The discrete argmax is sensitive to logit perturbation.
+- **Status**: COMPLETE. Negative result for CFG, but baseline quality preserved.
+
+### v36 — Native 768d (no projection), 42 layers
+
+- **Architecture**: Encoder-only 42L×768d — model_dim matches embed_dim (768), no embed_proj or output_proj
+  - Removes the 768→512 projection (embed_proj) and 512→768 projection (output_proj)
+  - mBERT embeddings flow directly into transformer at native 768d
+  - num_heads=12 (768/64), ff_dim=3072 (4×768)
+  - 301M trainable params, 392.8M total
+- **Motivation**: Prior 768d attempts (v30b/v31) failed at 24L — hypothesis is depth was the bottleneck, not width. Combined with unfrozen embeddings (v33 breakthrough) and no information-lossy projection, native 768d + 42L depth could outperform the 512d models.
+- **Config**: batch_size=28, grad_accum=19, effective_batch≈1064, lr=1e-4, warmup=4K, 200K steps
+- **Initialization**: From scratch (dimension mismatch prevents init from v34). mBERT embeddings loaded fresh.
+- **VRAM**: ~18 GB peak per GPU (batch=28, fp16), fits 24GB TITAN RTX with DDP
+- **Training**: 2026-04-04 to 2026-04-05, ~2 steps/sec, ~28 hours total
+- **Val loss trajectory**: 3.74 (2.5K) → 2.00 (75K) → 1.91 (80K) → 1.71 (172.5K best) → 1.76 (200K final)
+- **Health check at 200K**: t50_acc=81%, t100_acc=61%, t150_unique=334, t200_unique=287
+- **BLEU (500 sentences)**:
+  - Step 170K (best val_loss region): **14.45** (temp=1.0)
+  - Step 200K (final): **14.27** (temp=1.0)
+  - temp=2.0: 14.43, temp=0.5: 13.92 — temperature doesn't help
+- **Key finding**: MASSIVE BLEU REGRESSION despite good val_loss. Val_loss 1.71 is better than v26's ~1.80, but BLEU 14.45 << v26's 18.41 and v34's 21.18.
+- **Diagnosis**: Training from scratch at 768d×42L for 200K steps is insufficient. The cascaded init chain (v26→v32→v33→v34) provides 500K+ effective training steps. Also, removing the output_proj GELU nonlinearity may hurt — the model must linearly map to mBERT embedding space. Sample translations show source copying (English words left untranslated) and garbled compound words.
+- **Status**: COMPLETE. Negative result — native 768d doesn't help.
